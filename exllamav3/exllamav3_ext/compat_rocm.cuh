@@ -31,6 +31,16 @@ namespace polyfill
 
 __device__ __forceinline__ int dp4a(uint32_t a, uint32_t b, int c)
 {
+    // every call site in this codebase passes unsigned byte lanes (codebook decode), so the
+    // u8 dot is exact; gfx9+/gfx10+/gfx11+ have it as v_dot4_u32_u8
+#if defined(__gfx908__) || defined(__gfx90a__) || defined(__gfx942__) || defined(__gfx950__) || \
+    defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__) || defined(__gfx1033__) || \
+    defined(__gfx1034__) || defined(__gfx1035__) || defined(__gfx1036__) || \
+    defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
+    defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1153__) || \
+    defined(__gfx1200__) || defined(__gfx1201__)
+    return (int) __builtin_amdgcn_udot4(a, b, (uint32_t) c, false);
+#else
     int result = c;
     #pragma unroll
     for (int i = 0; i < 4; i++)
@@ -40,6 +50,7 @@ __device__ __forceinline__ int dp4a(uint32_t a, uint32_t b, int c)
         result += va * vb;
     }
     return result;
+#endif
 }
 
 __device__ __forceinline__ uint32_t dp4a(uint32_t a, uint32_t b, uint32_t c)
@@ -91,6 +102,19 @@ __device__ __forceinline__ __hip_bfloat16 float2bfloat16_rn(float f)
 #ifndef __float2bfloat16_rn
 #define __float2bfloat16_rn polyfill::float2bfloat16_rn
 #endif
+#endif
+
+// HIP's fp16 header only provides __ldcg for __half/__half2; CUDA's is generic over the
+// scalar types. Cache-hint-free loads are the correct semantics on AMD (no L1 bypass to
+// express), so plain dereferences
+#if defined(__HIPCC__)
+__device__ __forceinline__ float __ldcg(const float* p) { return *p; }
+__device__ __forceinline__ int __ldcg(const int* p) { return *p; }
+__device__ __forceinline__ unsigned int __ldcg(const unsigned int* p) { return *p; }
+__device__ __forceinline__ float2 __ldcg(const float2* p) { return *p; }
+__device__ __forceinline__ float4 __ldcg(const float4* p) { return *p; }
+__device__ __forceinline__ int4 __ldcg(const int4* p) { return *p; }
+__device__ __forceinline__ uint4 __ldcg(const uint4* p) { return *p; }
 #endif
 
 // mask dropped (call sites are full-warp); HIP's masked 64-bit __syncwarp

@@ -26,6 +26,11 @@
 // would request the LDS once per instantiation
 #define EXL3_INNER_SH_FLOATS(ts_n) (16 * (ts_n))
 
+// 1: route the 4/6-bit mul1 tensors through the generic k-split lane tier as well
+#ifndef EXL3_ROCM_LANE_TIER_ALL
+#define EXL3_ROCM_LANE_TIER_ALL 1
+#endif
+
 namespace exl3_rocm_inner
 {
 
@@ -52,6 +57,38 @@ __device__ __forceinline__ float decode_w_mul1(uint32_t code)
     return __half2float(__float2half(v));
 }
 
+// mul1 codebook, RDNA fast path. The codebook value is k_inv * (1024 + bytesum(code * M)) + k_bias
+// with M = 0x83DCD12D. The 16-bit code times the 32-bit constant mod 2^32 splits into two 16x16
+// products (v_mad_u32_u16 / v_mul_lo_u16, full rate, and they read the low half of `code` so the
+// upper bits need no masking), and the byte sum is v_sad_u8 against 0 (full rate) rather than the
+// quarter-rate v_dot4. With the accumulator 0x6400 the result's low half is the fp16 value
+// 1024 + bytesum exactly, which feeds v_fma_mix_f32 directly; the affine correction
+// (k_inv, k_bias * sum(x)) is applied once per output instead of once per weight
+#ifndef EXL3_ROCM_FAST_MUL1
+#define EXL3_ROCM_FAST_MUL1 1
+#endif
+__device__ __forceinline__ uint32_t mul1_h1024(uint32_t code)
+{
+#if EXL3_ROCM_FAST_MUL1
+    // Two full-rate 16-bit multiplies (the compiler would otherwise fold the high product back
+    // into a quarter-rate v_mul_lo_u32), reading only the low 16 bits of `code` so the funnel
+    // shift's garbage above bit 15 never needs masking:
+    //   t  = lo16(code) * 0xD12D                    (v_mad_u32_u16, full 32-bit result)
+    //   t += (lo16(code) * 0x83DC) << 16            (v_mad_u16 into the high half via op_sel)
+    //   == code * 0x83DCD12D mod 2^32
+    uint32_t t;
+    asm("v_mad_u32_u16 %0, %1, %2, 0" : "=v"(t) : "v"(code), "s"(0xD12Du));
+    asm("v_mad_u16 %0, %1, %2, %0 op_sel:[0,0,1,1]" : "+v"(t) : "v"(code), "s"(0x83DCu));
+    return __builtin_amdgcn_sad_u8(t, 0u, 0x6400u);
+#else
+    const uint32_t p = (code & 0xFFFFu) * 0x83DCD12Du;
+    return __builtin_amdgcn_udot4(p, 0x01010101u, 0x6400u, false);
+#endif
+}
+// fp16 constants of the mul1 codebook affine map
+#define MUL1_K_INV_BITS  0x1EEEu   //  0.00677 = 1/147.7
+#define MUL1_K_BIAS_BITS 0xC931u   // -10.39
+
 // Column lock (ptx.cuh protocol): counts completed k-tiles of one column tile;
 // the topmost block resets it to 0 for the next call
 
@@ -61,9 +98,13 @@ __device__ __forceinline__ void lock_acquire(int* lock, int stage)
     {
         unsigned int* a = (unsigned int*) lock;
         unsigned int state;
+        unsigned int spins = 0;
         do
         {
             state = __hip_atomic_load(a, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+            // A cooperative launch whose blocks are not all resident deadlocks here; surface it as
+            // a kernel fault instead of a silent hang
+            if (++spins == (1u << 28)) __builtin_trap();
         }
         while (state != (unsigned int) stage);
     }
@@ -237,11 +278,203 @@ __device__ __forceinline__ void phase1_b6c2(SegCtx& c)
     }
 }
 
+// Tier A': generic lane-local decode for any bitrate (integer 1..8 or KA + 0.5, any codebook).
+// Same work split as Tier A (8 lanes per (subtile, m row) item, lane L owns the 32 trellis
+// positions 32L..32L+31 = output columns L and L+8 over the 16 k rows) but the 16-bit code
+// windows are cut with compile-time shifts from the lane's own word run, so no lane reads
+// another lane's words and the per-weight cost is a funnel shift plus the codebook decode.
+//
+// Bit layout (see exl3_dq.cuh): word index ascends with the logical bit index, the MSB of a
+// word is its first logical bit, and position e's code is the 16-bit window ending at
+// E(e) = sum_{q<=e} bits(q), with bits(q) = bits + (half_k && (q & 1)). A lane's 32 positions
+// occupy LANE_BITS = 32 * bits + (half_k ? 16 : 0) logical bits starting at LANE_BITS * L; for
+// half_k that start is mid-word on odd lanes, which is fixed by re-aligning the word run 16 bits
+// once per k-tile so every window shift below stays a compile-time constant.
+
+template <int bits, bool half_k>
+__device__ __forceinline__ constexpr int lane_e_rel(int i)
+{
+    // end bit (exclusive) of lane position i relative to the lane's aligned stream
+    return bits * (i + 1) + (half_k ? ((i + 1) >> 1) : 0);
+}
+
+template <int bits, bool half_k, int cb>
+__device__ __forceinline__ void phase1_lane(SegCtx& c)
+{
+    constexpr int SUB_U32 = 8 * bits + (half_k ? 4 : 0);        // words per 16x16 subtile
+    constexpr int LANE_BITS = 32 * bits + (half_k ? 16 : 0);    // bits per lane
+    constexpr int NW = half_k ? (LANE_BITS + 16 + 31) / 32 : bits;   // words after alignment
+    static_assert(NW * 32 >= LANE_BITS, "lane word run too short");
+
+    int lane = threadIdx.x & 7;
+    int rem = threadIdx.x >> 3;
+    int groups = blockDim.x >> 3;
+    int items = c.subs_tile * c.size_m;
+
+    // Decode-shaped calls leave most 8-lane groups idle (items < groups) while each active
+    // group walks its whole k segment serially, so the block is latency-bound on one load
+    // chain per group. Split the segment across the idle groups instead and reduce the
+    // partials through LDS atomics; the segment partial is then a sum of KS chains
+    const int cols = c.subs_tile * 16;
+    int KS = groups / items;
+    if (KS < 1) KS = 1;
+    const int seg_len = c.kt1 - c.kt0;
+    if (KS > seg_len) KS = seg_len;
+
+    // (barrier first: the previous column tile's write-out may still be reading sh_c)
+    __syncthreads();
+    for (int i = threadIdx.x; i < c.size_m * cols; i += blockDim.x) c.sh_c[i] = 0.f;
+    __syncthreads();
+
+    const int base_bit = LANE_BITS * lane;
+    const int bw = base_bit >> 5;
+    const bool odd = half_k && ((base_bit & 31) != 0);
+    const int bw_prev = (bw == 0) ? (SUB_U32 - 1) : (bw - 1);
+
+    for (int idx = rem; idx < items * KS; idx += groups)
+    {
+        int item = idx / KS;
+        int ks = idx - item * KS;
+        int s_ = item % c.subs_tile;
+        int n = c.col * c.subs_tile + s_;
+        int m = item / c.subs_tile;
+        const int t0 = c.kt0 + (int) ((int64_t) seg_len * ks / KS);
+        const int t1 = c.kt0 + (int) ((int64_t) seg_len * (ks + 1) / KS);
+
+        const uint32_t* base =
+            (const uint32_t*) c.B + (size_t) c.kt0 * (c.nsub_total * SUB_U32) + (size_t) n * SUB_U32;
+        const half* x = c.A + (size_t) m * c.size_k;
+        float acc0 = 0.f, acc1 = 0.f, xsum = 0.f;
+
+        // Software pipeline (depth 1): tile t + 1 is requested before tile t is decoded
+        uint32_t bufA[NW + 1], bufB[NW + 1];
+        uint32_t xA[8], xB[8];
+
+        auto load_tile = [&](int t, uint32_t* a, uint32_t* xw)
+        {
+            const uint32_t* p32 = base + (size_t) (t - c.kt0) * (c.nsub_total * SUB_U32);
+            if constexpr (half_k)
+            {
+                uint32_t w[NW + 2];
+                w[0] = p32[bw_prev];
+                #pragma unroll
+                for (int k = 0; k < NW; ++k) w[k + 1] = p32[bw + k];
+                w[NW + 1] = 0;
+                #pragma unroll
+                for (int k = 0; k <= NW; ++k)
+                    a[k] = odd ? ((w[k] << 16) | (w[k + 1] >> 16)) : w[k];
+            }
+            else
+            {
+                a[0] = p32[bw_prev];
+                #pragma unroll
+                for (int k = 0; k < NW; ++k) a[k + 1] = p32[bw + k];
+            }
+            const uint4* xp = (const uint4*) (x + t * 16);
+            uint4 x0 = xp[0], x1 = xp[1];
+            xw[0] = x0.x; xw[1] = x0.y; xw[2] = x0.z; xw[3] = x0.w;
+            xw[4] = x1.x; xw[5] = x1.y; xw[6] = x1.z; xw[7] = x1.w;
+        };
+
+        auto decode_tile = [&](const uint32_t* a, const uint32_t* xw)
+        {
+
+            if constexpr (cb == 2)
+            {
+                half xh[16];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i)
+                {
+                    xh[2 * i]     = __ushort_as_half((unsigned short) (xw[i] & 0xFFFFu));
+                    xh[2 * i + 1] = __ushort_as_half((unsigned short) (xw[i] >> 16));
+                }
+                #pragma unroll
+                for (int i = 0; i < 32; ++i)
+                {
+                    const int E = lane_e_rel<bits, half_k>(i);
+                    const int p = (E - 1) >> 5;
+                    const int sh = 32 * (p + 1) - E;
+                    uint32_t code = __funnelshift_r(a[p + 1], a[p], sh);    // low 16 bits = code
+                    uint32_t h = mul1_h1024(code);
+                    half wh = __ushort_as_half((unsigned short) h);
+                    const int g = i >> 3, k = i & 7;
+                    const int r = 2 * g + (k & 1) + 8 * ((k >> 1) & 1);
+                    if (k < 4) acc0 = fmaf(__half2float(wh), __half2float(xh[r]), acc0);
+                    else       acc1 = fmaf(__half2float(wh), __half2float(xh[r]), acc1);
+                }
+                float sx = 0.f;
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) sx += __half2float(xh[i]);
+                xsum += sx;
+            }
+            else
+            {
+                float xf[16];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i)
+                {
+                    xf[2 * i]     = __half2float(__ushort_as_half((unsigned short) (xw[i] & 0xFFFFu)));
+                    xf[2 * i + 1] = __half2float(__ushort_as_half((unsigned short) (xw[i] >> 16)));
+                }
+                #pragma unroll
+                for (int i = 0; i < 32; ++i)
+                {
+                    const int E = lane_e_rel<bits, half_k>(i);
+                    const int p = (E - 1) >> 5;
+                    const int sh = 32 * (p + 1) - E;
+                    uint32_t code = alignbit16(a[p], a[p + 1], sh);
+                    float wv = __half2float(decode_3inst<cb>(code));
+                    const int g = i >> 3, k = i & 7;
+                    const int r = 2 * g + (k & 1) + 8 * ((k >> 1) & 1);
+                    if (k < 4) acc0 += wv * xf[r];
+                    else       acc1 += wv * xf[r];
+                }
+            }
+
+        };
+
+
+        int t = t0;
+        if (t < t1) load_tile(t, bufA, xA);
+        for (; t + 1 < t1; t += 2)
+        {
+            load_tile(t + 1, bufB, xB);  decode_tile(bufA, xA);
+            if (t + 2 < t1) load_tile(t + 2, bufA, xA);
+            decode_tile(bufB, xB);
+        }
+        if (t < t1) decode_tile(bufA, xA);
+
+        if constexpr (cb == 2)
+        {
+            // acc = sum (1024 + s) * x  ->  sum w * x = k_inv * acc + k_bias * sum x
+            const float k_inv = __half2float(__ushort_as_half((unsigned short) MUL1_K_INV_BITS));
+            const float k_bias = __half2float(__ushort_as_half((unsigned short) MUL1_K_BIAS_BITS));
+            acc0 = k_inv * acc0 + k_bias * xsum;
+            acc1 = k_inv * acc1 + k_bias * xsum;
+        }
+
+        float* out = c.sh_c + (size_t) m * cols + (size_t) s_ * 16;
+        if (KS == 1)
+        {
+            out[lane] = acc0;
+            out[lane + 8] = acc1;
+        }
+        else
+        {
+            atomicAdd(out + lane, acc0);
+            atomicAdd(out + lane + 8, acc1);
+        }
+    }
+}
+
 // Tier C: everything else. One warp per subtile through dq_dispatch
 
-template <int bits, int cb>
+template <int bits, int cb, bool half_k = false>
 __device__ __forceinline__ void phase1_dq(SegCtx& c)
 {
+    // uint32 words per 16x16 subtile: 8 * bits for integer K, 8 * bits + 4 for K + 0.5 (mul1 only)
+    constexpr int SUB_U32 = 8 * bits + (half_k ? 4 : 0);
+
     int lane_id = threadIdx.x & 31;
     int warp = threadIdx.x >> 5;
     int warps = blockDim.x >> 5;
@@ -254,7 +487,7 @@ __device__ __forceinline__ void phase1_dq(SegCtx& c)
     {
         int n = c.col * c.subs_tile + idx;
         const uint32_t* sub_base =
-            (const uint32_t*) c.B + (size_t) c.kt0 * (c.nsub_total * (8 * bits)) + (size_t) n * (8 * bits);
+            (const uint32_t*) c.B + (size_t) c.kt0 * (c.nsub_total * SUB_U32) + (size_t) n * SUB_U32;
 
         float acc[16][2];
         #pragma unroll
@@ -262,10 +495,10 @@ __device__ __forceinline__ void phase1_dq(SegCtx& c)
 
         for (int t = c.kt0; t < c.kt1; ++t)
         {
-            const uint32_t* ptr = sub_base + (size_t) (t - c.kt0) * (c.nsub_total * (8 * bits));
+            const uint32_t* ptr = sub_base + (size_t) (t - c.kt0) * (c.nsub_total * SUB_U32);
 
             FragB frag[2];
-            dq_dispatch<bits, cb>(ptr, lane_id * 8, frag[0], frag[1]);
+            dq_dispatch<bits, cb, half_k>(ptr, lane_id * 8, frag[0], frag[1]);
 
             #pragma unroll
             for (int m = 0; m < 16; ++m)
@@ -363,17 +596,23 @@ __device__ void exl3_gemm_kernel_inner
         c.col = col;
         int cols = c.subs_tile * 16;
 
-        if constexpr (cb == 2 && bits == 4)
+        // Lane-local tiers re-decode the weights once per m row, the warp tier once per
+        // subtile: the former wins for decode-shaped m, the latter for prefill chunks
+        constexpr int LANE_TIER_MAX_M = 8;
+        if constexpr (cb == 2 && bits == 4 && !half_k && !EXL3_ROCM_LANE_TIER_ALL)
         {
             phase1_b4c2(c);
         }
-        else if constexpr (cb == 2 && bits == 6)
+        else if constexpr (cb == 2 && bits == 6 && !half_k && !EXL3_ROCM_LANE_TIER_ALL)
         {
             phase1_b6c2(c);
         }
         else if constexpr (bits > 0)
         {
-            phase1_dq<bits, cb>(c);
+            if (c.size_m <= LANE_TIER_MAX_M)
+                phase1_lane<bits, half_k, cb>(c);
+            else
+                phase1_dq<bits, cb, half_k>(c);
         }
         // bits == 0 never reaches the inner (the caller switches on K first)
 

@@ -14,7 +14,9 @@
 bool exl3_gemv_try_launch
 (
     void**,
-    int, int, int, int, int,
+    int, int, int, int,
+    bool,
+    int,
     bool, bool,
     int,
     cudaStream_t,
@@ -24,6 +26,8 @@ bool exl3_gemv_try_launch
 {
     return false;
 }
+
+void* exl3_gemv_select_kernel_half(int, bool, int, int, bool) { return nullptr; }
 
 void exl3_gemv
 (
@@ -94,14 +98,14 @@ MoeCoopParams exl3_moe_coop_prepare
     const c10::optional<at::Tensor>&,
     const c10::optional<at::Tensor>&,
     const c10::optional<at::Tensor>&,
-    int, int, int,
+    float, float, float,
     bool, bool,
     int, float,
     bool,
     at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,      // had_g, had_u, gu_g, gu_u
     at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&,      // act_out, d_out, ctr, out
     const c10::optional<at::Tensor>&,                        // sh_gate_w
-    int&, int&, int&
+    float&, float&, int&
 )
 {
     return MoeCoopParams{};
@@ -109,7 +113,7 @@ MoeCoopParams exl3_moe_coop_prepare
 
 void exl3_moe_coop_run
 (
-    MoeCoopParams, int, int, int,
+    MoeCoopParams, float, float, int,
     const at::Tensor&, const at::Tensor&, const at::Tensor&,
     const c10::optional<at::Tensor>&
 )
@@ -117,7 +121,7 @@ void exl3_moe_coop_run
     TORCH_CHECK(false, "exl3_moe_coop_run: coop MoE kernel is not built on ROCm (use_mgemm declines the path)");
 }
 
-void exl3_moe_coop_launch(const MoeCoopParams&, int, int, int, int, cudaStream_t)
+void exl3_moe_coop_launch(const MoeCoopParams&, float, float, int, int, cudaStream_t)
 {
     TORCH_CHECK(false, "exl3_moe_coop_launch: coop MoE kernel is not built on ROCm");
 }
@@ -132,7 +136,7 @@ void exl3_moe_coop
     const c10::optional<at::Tensor>&,
     const c10::optional<at::Tensor>&,
     const c10::optional<at::Tensor>&,
-    int, int, int,
+    float, float, float,
     bool, bool,
     int, float,
     bool,
@@ -143,6 +147,41 @@ void exl3_moe_coop
 )
 {
     TORCH_CHECK(false, "exl3_moe_coop: coop MoE kernel is not built on ROCm");
+}
+
+
+// det_gemm.cuh (mma.sync / cp.async / ldmatrix PTX) has no HIP port: the deterministic int8
+// tensor-core routing GEMM and the tiled GatedResidual mix are excluded (build_config.py).
+// Callers fall back to their cuBLAS / eager paths when these decline
+#include "routing.cuh"
+#include "hc_mix.cuh"
+
+bool routing_gemm_det_fits(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&) { return false; }
+void routing_gemm_det_(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, cudaStream_t)
+{
+    TORCH_CHECK(false, "routing_gemm_det: not built on ROCm");
+}
+void routing_gemm_det(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor)
+{
+    TORCH_CHECK(false, "routing_gemm_det: not built on ROCm");
+}
+void det_quant_weight(const at::Tensor&, at::Tensor, at::Tensor)
+{
+    TORCH_CHECK(false, "det_quant_weight: not built on ROCm");
+}
+void det_math_test(const at::Tensor&, at::Tensor)
+{
+    TORCH_CHECK(false, "det_math_test: not built on ROCm");
+}
+int gr_mix_tiled_slices(int, int, int) { return 0; }
+void gr_mix_tiled
+(
+    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, double, int, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+    c10::optional<at::Tensor>, at::Tensor
+)
+{
+    TORCH_CHECK(false, "gr_mix_tiled: not built on ROCm");
 }
 
 #endif
