@@ -93,8 +93,17 @@ __device__ __forceinline__ float decode_w_mul1(uint32_t code)
 #ifndef EXL3_ROCM_ILV
 #define EXL3_ROCM_ILV 8     // codes decoded in lock-step per stage (see phase1_lane)
 #endif
+// software pipeline of the lane tier's k loop:
+//   1: depth 1 (load t+1 before decode t)               2 buffers of (weights + x)
+//   2: depth 2 (load t+2 before decode t)               3 buffers of (weights + x)
+//   3: depth 2 for the weights, x just-in-time          3 weight buffers, 1 x buffer
+//   4: two independent half-segment chains, depth 1     4 weight buffers, 1 x buffer, 2 acc sets
 #ifndef EXL3_ROCM_PIPELINE
 #define EXL3_ROCM_PIPELINE 1
+#endif
+// 1: sched_barrier between the prefetch and the decode in the depth-1 loop
+#ifndef EXL3_ROCM_SCHED_BARRIER
+#define EXL3_ROCM_SCHED_BARRIER 0
 #endif
 #ifndef EXL3_ROCM_FAST_MUL1
 #define EXL3_ROCM_FAST_MUL1 1
@@ -129,9 +138,18 @@ __device__ __forceinline__ void lock_acquire(int* lock, int stage)
     {
         unsigned int* a = (unsigned int*) lock;
         unsigned int state;
+#ifdef EXL3_ROCM_BOUNDS
+        // debug: the column lock relies on every block of the grid being co-resident (a block
+        // spins on the blocks above it in k). If the grid exceeds the real occupancy the GPU
+        // deadlocks and takes the machine with it -> bounded spin, trap instead
+        unsigned int spins = 0;
+#endif
         do
         {
             state = __hip_atomic_load(a, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+#ifdef EXL3_ROCM_BOUNDS
+            if (++spins > 200000000u) __builtin_trap();   // ~ seconds
+#endif
         }
         while (state != (unsigned int) stage);
     }
@@ -384,8 +402,57 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
         uint32_t bufA[NW + 1], bufB[NW + 1];
         uint32_t xA[8], xB[8];
 
+        // weight words only (x fetched separately: variant 3 = weights 2 ahead, x just-in-time)
+        auto load_w = [&](int t, uint32_t* a)
+        {
+#ifdef EXL3_ROCM_BOUNDS
+            if (t < c.kt0 || t >= c.kt1 || t < t0 || t >= t1 || t * 16 >= c.size_k) __builtin_trap();
+#endif
+            const uint32_t* p32 = base + (size_t) (t - c.kt0) * (c.nsub_total * SUB_U32);
+            if constexpr (half_k)
+            {
+                uint32_t w[NW + 2];
+                w[0] = p32[bw_prev];
+                #pragma unroll
+                for (int k = 0; k < NW; ++k) w[k + 1] = p32[bw + k];
+                w[NW + 1] = 0;
+                #pragma unroll
+                for (int k = 0; k <= NW; ++k)
+                    a[k] = odd ? ((w[k] << 16) | (w[k + 1] >> 16)) : w[k];
+            }
+            else
+            {
+                a[0] = p32[bw_prev];
+                #pragma unroll
+                for (int k = 0; k < NW; ++k) a[k + 1] = p32[bw + k];
+            }
+        };
+        auto load_x = [&](int t, uint32_t* xw)
+        {
+            if (c.xl)
+            {
+                typedef __attribute__((address_space(3))) const uint32_t lds_u32;
+                lds_u32* xp = (lds_u32*) (const uint32_t*) (x + (t - x_t0) * 16);
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) xw[k] = xp[k];
+                return;
+            }
+            typedef __attribute__((address_space(1))) const uint4 gl_uint4;
+            gl_uint4* xp = (gl_uint4*) (const uint4*) (x + t * 16);
+            uint4 x0, x1;
+            x0.x = xp[0].x; x0.y = xp[0].y; x0.z = xp[0].z; x0.w = xp[0].w;
+            x1.x = xp[1].x; x1.y = xp[1].y; x1.z = xp[1].z; x1.w = xp[1].w;
+            xw[0] = x0.x; xw[1] = x0.y; xw[2] = x0.z; xw[3] = x0.w;
+            xw[4] = x1.x; xw[5] = x1.y; xw[6] = x1.z; xw[7] = x1.w;
+        };
+
         auto load_tile = [&](int t, uint32_t* a, uint32_t* xw)
         {
+#ifdef EXL3_ROCM_BOUNDS
+            // debug: a tile index outside the segment means a pipeline bug -> trap (queue error,
+            // process abort) instead of an unmapped read that hangs the GPU / the whole machine
+            if (t < c.kt0 || t >= c.kt1 || t < t0 || t >= t1 || t * 16 >= c.size_k) __builtin_trap();
+#endif
             const uint32_t* p32 = base + (size_t) (t - c.kt0) * (c.nsub_total * SUB_U32);
             if constexpr (half_k)
             {
@@ -541,15 +608,114 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
         // `for (; t + 1 < t1; t += 2)` form with in-loop conditional loads into a non-terminating
         // loop for the half-integer instances
         const int ntiles = t1 - t0;
+#if EXL3_ROCM_PIPELINE >= 2
+        // depth 2: three buffers, loads issued two tiles ahead. Fixed trip count (groups of 3)
+        // + explicit tail, and NO divergent branches inside the loop: the prefetch index is
+        // clamped to the last tile (a redundant in-bounds load) instead of being predicated.
+        // Both the `break`-terminated and the `if (i + k < ntiles)` forms compiled into
+        // non-terminating loops (see notes.md)
+        uint32_t bufC[NW + 1], xC[8];
+        if (ntiles > 0) load_tile(t0, bufA, xA);
+        if (ntiles > 1) load_tile(t0 + 1, bufB, xB);
+        const int nfull = ntiles / 3;
+        const int tlast = t1 - 1;
+        for (int g = 0; g < nfull; ++g)
+        {
+            const int i = g * 3;
+            load_tile(t0 + i + 2, bufC, xC);                      // i + 2 < ntiles always holds here
+            decode_tile(bufA, xA);
+            load_tile(min(t0 + i + 3, tlast), bufA, xA);
+            decode_tile(bufB, xB);
+            load_tile(min(t0 + i + 4, tlast), bufB, xB);
+            decode_tile(bufC, xC);
+        }
+        // tail (0..2 tiles): already resident in bufA / bufB
+        const int ntail = ntiles - nfull * 3;
+        if (ntail >= 1) decode_tile(bufA, xA);
+        if (ntail >= 2) decode_tile(bufB, xB);
+#elif EXL3_ROCM_PIPELINE == 4
+        // variant 1 (dual chain): the group's k range is split in two halves that advance in
+        // lock-step, each with its own depth-1 prefetch and its own accumulators -> two independent
+        // load chains per lane (2 tiles in flight, like depth 2) AND two independent FMA chains.
+        // x is fetched just-in-time (LDS / L2), weights are buffered: 4 x (NW+1) VGPRs
+        {
+            const int half = ntiles >> 1;             // chain 0: [t0, t0+half), chain 1: [t0+half, t1)
+            const int n1 = ntiles - half;              // n1 >= half
+            uint32_t bufA2[NW + 1], bufB2[NW + 1];
+            float acc0b = 0.f, acc1b = 0.f;
+            // decode into a second accumulator set: swap, decode, swap back (register renames only)
+            auto decode_tile_b = [&](const uint32_t* a, const uint32_t* xw)
+            {
+                float s0 = acc0, s1 = acc1; acc0 = acc0b; acc1 = acc1b;
+                decode_tile(a, xw);
+                acc0b = acc0; acc1b = acc1; acc0 = s0; acc1 = s1;
+            };
+            const int ta0 = t0, tb0 = t0 + half;
+            if (half > 0) load_w(ta0, bufA);
+            if (n1 > 0) load_w(tb0, bufA2);
+            // paired steps over the common length `half` (fixed trip count, no divergent branches)
+            const int tlast_a = t0 + half - 1, tlast_b = t1 - 1;
+            for (int i = 0; i < half; i += 2)
+            {
+                load_w(min(ta0 + i + 1, tlast_a), bufB);
+                load_w(min(tb0 + i + 1, tlast_b), bufB2);
+                load_x(ta0 + i, xA); decode_tile(bufA, xA);
+                load_x(tb0 + i, xA); decode_tile_b(bufA2, xA);
+                load_w(min(ta0 + i + 2, tlast_a), bufA);
+                load_w(min(tb0 + i + 2, tlast_b), bufA2);
+                if (i + 1 < half)
+                {
+                    load_x(ta0 + i + 1, xA); decode_tile(bufB, xA);
+                    load_x(tb0 + i + 1, xA); decode_tile_b(bufB2, xA);
+                }
+            }
+            // chain 1 is at most one tile longer
+            if (n1 > half) { load_x(tb0 + half, xA); decode_tile_b(bufA2, xA); }
+            acc0 += acc0b; acc1 += acc1b;
+        }
+#elif EXL3_ROCM_PIPELINE == 3
+        // variant 3: weights two tiles ahead (3 weight buffers), x fetched just-in-time (LDS slice
+        // or L2-resident A: short latency, so no need to buffer it) -> saves 2 x 8 VGPRs vs depth 2
+        uint32_t bufC[NW + 1];
+        if (ntiles > 0) load_w(t0, bufA);
+        if (ntiles > 1) load_w(t0 + 1, bufB);
+        const int nfull = ntiles / 3;
+        const int tlast = t1 - 1;
+        for (int g = 0; g < nfull; ++g)
+        {
+            const int i = g * 3;
+            load_w(t0 + i + 2, bufC);
+            load_x(t0 + i, xA);
+            decode_tile(bufA, xA);
+            load_w(min(t0 + i + 3, tlast), bufA);
+            load_x(t0 + i + 1, xA);
+            decode_tile(bufB, xA);
+            load_w(min(t0 + i + 4, tlast), bufB);
+            load_x(t0 + i + 2, xA);
+            decode_tile(bufC, xA);
+        }
+        const int ntail = ntiles - nfull * 3;
+        if (ntail >= 1) { load_x(t0 + nfull * 3, xA); decode_tile(bufA, xA); }
+        if (ntail >= 2) { load_x(t0 + nfull * 3 + 1, xA); decode_tile(bufB, xA); }
+#else
         if (ntiles > 0) load_tile(t0, bufA, xA);
         for (int i = 0; i < ntiles; i += 2)
         {
             const bool has_b = (i + 1 < ntiles);
             if (has_b) load_tile(t0 + i + 1, bufB, xB);
+#if EXL3_ROCM_SCHED_BARRIER
+            // variant 4: keep the prefetch (VMEM) ahead of the decode (VALU) - the compiler is
+            // otherwise free to sink the loads towards their uses
+            __builtin_amdgcn_sched_barrier(0);
+#endif
             decode_tile(bufA, xA);
             if (i + 2 < ntiles) load_tile(t0 + i + 2, bufA, xA);
+#if EXL3_ROCM_SCHED_BARRIER
+            __builtin_amdgcn_sched_barrier(0);
+#endif
             if (has_b) decode_tile(bufB, xB);
         }
+#endif
 #else
         for (int t = t0; t < t1; ++t) { load_tile(t, bufA, xA); decode_tile(bufA, xA); }
 #endif

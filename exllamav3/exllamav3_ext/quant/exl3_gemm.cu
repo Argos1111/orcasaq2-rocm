@@ -14,6 +14,7 @@ namespace cg = cooperative_groups;
 #include "exl3_gemv.cuh"
 #include "exl3_gemv_int8.cuh"
 #include "coop_autotune.cuh"
+#include "rocm_coresidency.cuh"
 #include <set>
 #include <vector>
 
@@ -274,9 +275,7 @@ int exl3_gemm_gr
             if (!exl3_gemm_shape_compat(si, size_m, size_k, size_n, K) || fused_min_grid[si] < 0) continue;
             fp_exl3_gemm_kernel kf = get_gemm_kernel_ptr(K, si, c_fp32, cb, half_k);
             if (!kf) continue;
-            int bps = 1;
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, (const void*) kf, exl3_gemm_blockdim_g[si], GEMM_DYN_SMEM);
-            cudaGetLastError();
+            int bps = rocm_coresident_blocks_per_cu((const void*) kf, exl3_gemm_blockdim_g[si], GEMM_DYN_SMEM);
             int tilesize_k = exl3_gemm_tilesize_k_g[si];
             int max_slices = MAX(size_k / tilesize_k * size_n / exl3_gemm_tilesize_n_g[si], 1);
             int cap = MIN(max_slices, num_sms * MAX(MIN(bps, 12), 1));
@@ -403,15 +402,14 @@ int exl3_gemm_gr
 #if defined(USE_ROCM)
             // The HIP inner is a latency-bound streaming kernel (no tensor-core pipeline), so it
             // profits from several resident blocks per CU; let the autotuner search up to the
-            // cooperative-launch occupancy limit rather than one block per CU
+            // MEASURED co-residency limit (the column lock deadlocks - and hangs the GPU - if any
+            // block of the grid is not resident; the occupancy API is not that bound on gfx11)
             {
-                int blocks_per_sm = 1;
-                cudaOccupancyMaxActiveBlocksPerMultiprocessor
+                int blocks_per_sm = rocm_coresident_blocks_per_cu
                 (
-                    &blocks_per_sm, (const void*) candidate_kernel,
+                    (const void*) candidate_kernel,
                     exl3_gemm_blockdim_g[candidate_shape_idx], GEMM_DYN_SMEM
                 );
-                cudaGetLastError();
                 grid_cap = num_sms * MAX(MIN(blocks_per_sm, 12), 1);
             }
 #endif
@@ -463,13 +461,19 @@ int exl3_gemm_gr
     }
     if (force_num_sms > 0)
     {
-        // forced grid (benchmarks): reject an over-subscribed cooperative launch with a Python
-        // exception instead of the fatal cuda_check exit
+        // forced grid (benchmarks): reject an over-subscribed launch with a Python exception
+        // instead of a GPU deadlock. EXL3_ROCM_UNSAFE_GRID=1 bypasses (co-residency experiments)
+#if defined(USE_ROCM)
+        static const bool unsafe = getenv("EXL3_ROCM_UNSAFE_GRID") != nullptr;
+        int blocks_per_sm = rocm_coresident_blocks_per_cu((const void*) kernel, block_dim, GEMM_DYN_SMEM);
+#else
+        const bool unsafe = false;
         int blocks_per_sm = 1;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, (const void*) kernel, block_dim, GEMM_DYN_SMEM);
         cudaGetLastError();
+#endif
         int max_blocks = blocks_per_sm * DevCtx::instance().get_num_sms(device);
-        TORCH_CHECK(num_sms <= max_blocks, "exl3_gemm: forced grid ", num_sms, " exceeds cooperative limit ", max_blocks, " for shape ", shape_idx);
+        TORCH_CHECK(unsafe || num_sms <= max_blocks, "exl3_gemm: forced grid ", num_sms, " exceeds co-residency limit ", max_blocks, " for shape ", shape_idx);
     }
 #if defined(USE_ROCM)
     cudaLaunchKernel((void*) kernel, dim3(num_sms), dim3(block_dim), kernelArgs, GEMM_DYN_SMEM, stream);
