@@ -110,13 +110,14 @@ static inline int exl3_rocm_fused_had_min_grid(int size_m, int size_k, int size_
 // co-residency limit; EXL3_ROCM_OVERSUB (default 1: grids beyond the bound measured slower in the
 // real decode chain on gfx1100 even when they win in isolation) x the measured bound is offered to the
 // autotuner. Multi-slab calls (size_m > 16) keep the column locks and the hard bound
-static inline int rocm_gemm_blocks_per_cu(const void* kernel, int block_dim, int smem, int size_m, int size_n, int tilesize_n, int num_cus)
+static inline int rocm_gemm_blocks_per_cu(const void* kernel, int block_dim, int smem, int size_m, int size_n, int tilesize_n, int num_cus, int oversub_default = 1)
 {
     int bps = rocm_coresident_blocks_per_cu(kernel, block_dim, smem);
 #if EXL3_ROCM_ORDERED_EPILOGUE
     if (size_m <= 16)
     {
-        static const int oversub = getenv("EXL3_ROCM_OVERSUB") ? atoi(getenv("EXL3_ROCM_OVERSUB")) : 1;
+        static const int oversub_env = getenv("EXL3_ROCM_OVERSUB") ? atoi(getenv("EXL3_ROCM_OVERSUB")) : 0;
+        const int oversub = oversub_env > 0 ? oversub_env : oversub_default;
         // the largest grid the ordered epilogue can serve for this shape (same test as the inner);
         // beyond it the kernel falls back to the locks and the hard bound applies
         int over = MAX(oversub, 1);
@@ -524,6 +525,143 @@ int exl3_gemm_gr
 }
 
 #if defined(USE_ROCM)
+int exl3_gemm2_gr
+(
+    const at::Tensor& A,
+    const at::Tensor& B0, at::Tensor& C0, const at::Tensor& svh0, const at::Tensor& suh0,
+    const at::Tensor& B1, at::Tensor& C1, const at::Tensor& svh1, const at::Tensor& suh1,
+    bool mcg, bool mul1,
+    int force_shape_idx, int force_num_sms,
+    Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(A.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+
+    TORCH_CHECK_DIM(B0, 3); TORCH_CHECK_DIM(B1, 3);
+    TORCH_CHECK_SHAPES(A, -1, B0, 0, 16);
+    TORCH_CHECK_SHAPES(C0, -1, B0, 1, 16);
+    TORCH_CHECK_SHAPES_FULL(B1, B0);
+    TORCH_CHECK_SHAPES_FULL(C1, C0);
+    TORCH_CHECK_DTYPE(A, kHalf); TORCH_CHECK_DTYPE(B0, kShort); TORCH_CHECK_DTYPE(C0, kHalf); TORCH_CHECK_DTYPE(C1, kHalf);
+    TORCH_CHECK(!(mcg && mul1), "Specified both mcg and mul1");
+
+    int device; cudaGetDevice(&device);
+    int num_sms = force_num_sms ? force_num_sms : DevCtx::instance().get_num_sms(device);
+    int cc = DevCtx::instance().get_cc(device);
+    int* locks = DevCtx::instance().get_locks(device);
+
+    const int tile_u16 = B0.size(2);
+    const bool half_k = (tile_u16 % 16) != 0;
+    int K = tile_u16 / 16;
+    TORCH_CHECK(!half_k || (tile_u16 % 16 == 8 && mul1), "exl3_gemm2: half-integer bitrates require the mul1 codebook");
+    int cb = mcg ? 1 : (mul1 ? 2 : 0);
+
+    int size_m = 1;
+    for (int d = 0; d < A.dim() - 1; ++d) size_m *= A.size(d);
+    TORCH_CHECK(size_m <= 16, "exl3_gemm2: size_m <= 16 only (decode path)");
+    int size_k = A.size(-1);
+    int size_n = B0.size(1) * 16;
+
+    const half* A_ptr = (const half*) A.data_ptr();
+    const uint16_t* B0_ptr = (const uint16_t*) B0.data_ptr();
+    const uint16_t* B1_ptr = (const uint16_t*) B1.data_ptr();
+    void* C0_ptr = C0.data_ptr(); void* C1_ptr = C1.data_ptr();
+    const half* suh_ptr = (const half*) suh0.data_ptr();
+    const half* suh1_ptr = (const half*) suh1.data_ptr();
+    const half* svh0_ptr = (const half*) svh0.data_ptr();
+    const half* svh1_ptr = (const half*) svh1.data_ptr();
+    half* A_had_dummy = nullptr;
+
+    // always the fused input Hadamard: with 2x the column tiles every shape's minimum LDS-safe
+    // grid halves relative to the single GEMM, and the grid bound below is checked against it
+    void* kernelArgs[] =
+    {
+        (void*)& A_ptr, (void*)& B0_ptr, (void*)& C0_ptr, (void*)& size_m, (void*)& size_k, (void*)& size_n,
+        (void*)& locks, (void*)& suh_ptr, (void*)& A_had_dummy, (void*)& svh0_ptr,
+        (void*)& B1_ptr, (void*)& C1_ptr, (void*)& svh1_ptr, (void*)& suh1_ptr
+    };
+    auto add_graph_args = [&](void* kernel_ptr)
+    {
+        if (graph)
+        {
+            graph->record_param(kernel_ptr, GP_gemm_A, 0);
+            graph->record_param(kernel_ptr, GP_gemm_C, 2);
+            graph->record_param(kernel_ptr, GP_gemm2_C1, 11);
+            graph->record_param(kernel_ptr, GP_end, 0);
+        }
+    };
+
+    int fused_min_grid[EXL3_GEMM_NUM_SHAPES + 1] = {};
+    for (int si = 1; si <= EXL3_GEMM_NUM_SHAPES; ++si)
+    {
+        if (!exl3_gemm_shape_compat(si, size_m, size_k, size_n, K)) continue;
+        // the virtual matrix is 2 * size_n wide
+        fused_min_grid[si] = exl3_rocm_fused_had_min_grid(size_m, size_k, 2 * size_n, exl3_gemm_tilesize_n_g[si]);
+    }
+
+    if (force_shape_idx <= 0 && force_num_sms <= 0)
+    {
+        uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, false, device, cc, num_sms, cb, half_k) ^ 0x6E3322ull;
+        CoopAutotuneLaunch tuned;
+        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, GEMM_DYN_SMEM, stream, &tuned))
+        {
+            add_graph_args((void*) tuned.kernel);
+            cuda_check(cudaPeekAtLastError());
+            return tuned.tag;
+        }
+        std::vector<CoopAutotuneCandidate> candidates;
+        for (int si = 1; si <= EXL3_GEMM_NUM_SHAPES; ++si)
+        {
+            if (!exl3_gemm_shape_compat(si, size_m, size_k, size_n, K) || fused_min_grid[si] < 0) continue;
+            fp_exl3_gemm2_kernel kf = get_gemm2_kernel_ptr(K, si, cb, half_k);
+            if (!kf) continue;
+            int tilesize_n = exl3_gemm_tilesize_n_g[si];
+            int max_slices = MAX(size_k / exl3_gemm_tilesize_k_g[si] * (2 * size_n) / tilesize_n, 1);
+            int bps = rocm_gemm_blocks_per_cu((const void*) kf, exl3_gemm_blockdim_g[si], GEMM_DYN_SMEM, size_m, 2 * size_n, tilesize_n, num_sms, 2);
+            int max_candidate_sms = MAX(MIN(max_slices, num_sms * bps), 1);
+            if (fused_min_grid[si] > max_candidate_sms) continue;
+            CoopAutotuneCandidate cand { (void*) kf, exl3_gemm_blockdim_g[si], max_candidate_sms, 1, num_sms, si };
+            cand.min_num_sms = fused_min_grid[si];
+            candidates.push_back(cand);
+        }
+        TORCH_CHECK(!candidates.empty(), "exl3_gemm2 autotune: no compatible kernel shapes");
+        tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, GEMM_DYN_SMEM, stream, (size_t) size_k * size_n * 2);
+        if (graph) add_graph_args((void*) tuned.kernel);
+        cuda_check(cudaPeekAtLastError());
+        return tuned.tag;
+    }
+
+    // forced (benchmarks)
+    int si = force_shape_idx > 0 ? force_shape_idx : 3;
+    TORCH_CHECK(exl3_gemm_shape_compat(si, size_m, size_k, size_n, K), "exl3_gemm2: forced shape incompatible");
+    fp_exl3_gemm2_kernel kernel = get_gemm2_kernel_ptr(K, si, cb, half_k);
+    int tilesize_n = exl3_gemm_tilesize_n_g[si];
+    int grid = force_num_sms > 0 ? force_num_sms : num_sms;
+    int max_slices = MAX(size_k / exl3_gemm_tilesize_k_g[si] * (2 * size_n) / tilesize_n, 1);
+    grid = MAX(MIN(grid, max_slices), 1);
+    TORCH_CHECK(fused_min_grid[si] >= 1 && grid >= fused_min_grid[si], "exl3_gemm2: forced grid ", grid, " below the fused-had minimum ", fused_min_grid[si]);
+    static const bool unsafe = getenv("EXL3_ROCM_UNSAFE_GRID") != nullptr;
+    int bps = rocm_gemm_blocks_per_cu((const void*) kernel, exl3_gemm_blockdim_g[si], GEMM_DYN_SMEM, size_m, 2 * size_n, tilesize_n, num_sms, 2);
+    TORCH_CHECK(unsafe || grid <= bps * num_sms, "exl3_gemm2: forced grid ", grid, " exceeds co-residency limit ", bps * num_sms, " for shape ", si);
+    cudaLaunchKernel((void*) kernel, dim3(grid), dim3(exl3_gemm_blockdim_g[si]), kernelArgs, GEMM_DYN_SMEM, stream);
+    add_graph_args((void*) kernel);
+    cuda_check(cudaPeekAtLastError());
+    return si;
+}
+
+int exl3_gemm2
+(
+    const at::Tensor& A,
+    const at::Tensor& B0, at::Tensor& C0, const at::Tensor& svh0, const at::Tensor& suh0,
+    const at::Tensor& B1, at::Tensor& C1, const at::Tensor& svh1, const at::Tensor& suh1,
+    bool mcg, bool mul1,
+    int force_shape_idx, int force_num_sms
+)
+{
+    return exl3_gemm2_gr(A, B0, C0, svh0, suh0, B1, C1, svh1, suh1, mcg, mul1, force_shape_idx, force_num_sms, nullptr);
+}
+
 // debug: copy the per-block probe area (see EXL3_ROCM_PROBE in the inner) into a tensor
 void exl3_rocm_probe_read(at::Tensor out)
 {

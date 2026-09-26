@@ -87,4 +87,25 @@ int exl3_mgemm
 
 #if defined(USE_ROCM)
 void exl3_rocm_probe_read(at::Tensor out);
+
+// Dual GEMM (gate/up fusion): C0 = A @ B0, C1 = A @ B1 for two matrices of identical (k, n, K,
+// codebook) in one launch; each with its own suh/svh. size_m <= 16 (decode). Graph params:
+// GP_gemm_A (0), GP_gemm_C (2), GP_gemm2_C1 (11)
+int exl3_gemm2_gr
+(
+    const at::Tensor& A,
+    const at::Tensor& B0, at::Tensor& C0, const at::Tensor& svh0, const at::Tensor& suh0,
+    const at::Tensor& B1, at::Tensor& C1, const at::Tensor& svh1, const at::Tensor& suh1,
+    bool mcg, bool mul1,
+    int force_shape_idx, int force_num_sms,
+    Graph* graph
+);
+int exl3_gemm2
+(
+    const at::Tensor& A,
+    const at::Tensor& B0, at::Tensor& C0, const at::Tensor& svh0, const at::Tensor& suh0,
+    const at::Tensor& B1, at::Tensor& C1, const at::Tensor& svh1, const at::Tensor& suh1,
+    bool mcg, bool mul1,
+    int force_shape_idx, int force_num_sms
+);
 #endif

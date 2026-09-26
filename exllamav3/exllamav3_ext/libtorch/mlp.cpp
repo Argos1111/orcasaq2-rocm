@@ -69,8 +69,24 @@ void BC_GatedMLP::run_bszN_gr
         at::Tensor u2 = gu_n.select(0, 1);
         at::Tensor gate_xh = guh_n.select(0, 0);
         at::Tensor up_xh   = guh_n.select(0, 1);
+#if defined(USE_ROCM)
+        // dual GEMM: one launch for gate and up when they share (k, n, K, codebook) and the
+        // call is decode-sized. Records GP_gemm_A, GP_gemm_C (gate), GP_gemm2_C1 (up)
+        static const bool no_dual = getenv("EXL3_ROCM_NO_GEMM2") != nullptr;
+        const bool dual = !no_dual && num_tokens <= 16 &&
+            gate->K == up->K && gate->mcg == up->mcg && gate->mul1 == up->mul1 &&
+            gate->trellis.sizes() == up->trellis.sizes() && !gate->bias && !up->bias;
+        dual_recorded[num_tokens - 1] = dual;
+        if (dual)
+        {
+            exl3_gemm2_gr(x, gate->trellis, g2, gate->svh, gate->suh, up->trellis, u2, up->svh, up->suh, gate->mcg, gate->mul1, -1, 0, graph);
+        }
+        else
+#endif
+        {
         exl3_gemm_gr(x, gate->trellis, g2, gate->suh, gate_xh, gate->svh, -1, gate->mcg, gate->mul1, 0, graph);
         exl3_gemm_gr(x, up->trellis, u2, up->suh, up_xh, up->svh, -1, up->mcg, up->mul1, 0, graph);
+        }
         if (gate->bias) add_gr(g2, gate->bias.value(), g2, graph);
         if (up->bias) add_gr(u2, up->bias.value(), u2, graph);
     }
@@ -130,10 +146,21 @@ void BC_GatedMLP::run_bszN
             // The gate/up GEMMs record their own GP_gemm_C sites ahead of the down projection's;
             // patch them with their (static) values so the site walk stays aligned and the final
             // GP_gemm_C entry binds to the down projection
+#if defined(USE_ROCM)
+            if (dual_recorded[graphidx])
+            {
+                args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+                args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 0).data_ptr());
+                args.emplace_back(GP_gemm2_C1, (void*) gu_n.select(0, 1).data_ptr());
+            }
+            else
+#endif
+            {
             args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
             args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 0).data_ptr());
             args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
             args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 1).data_ptr());
+            }
         }
         args.emplace_back(GP_gemm_C, (void*) d.data_ptr());
         if (down->bias)

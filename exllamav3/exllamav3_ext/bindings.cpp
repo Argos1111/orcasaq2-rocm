@@ -162,6 +162,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("exl3_gemm", &exl3_gemm, "exl3_gemm");
 #if defined(USE_ROCM)
     m.def("exl3_rocm_probe_read", &exl3_rocm_probe_read, "exl3_rocm_probe_read");
+    m.def("exl3_gemm2", &exl3_gemm2, "exl3_gemm2");
 #endif
     m.def("exl3_gemv", &exl3_gemv, "exl3_gemv");
     m.def("exl3_gemm_num_kernel_shapes", &exl3_gemm_num_kernel_shapes, "exl3_gemm_num_kernel_shapes");

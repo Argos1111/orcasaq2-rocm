@@ -24,6 +24,7 @@ enum GraphedParams
     GP_gemm_B_suh,
     GP_gemm_A_had,
     GP_gemm_B_svh,
+    GP_gemm2_C1,      // ROCm dual GEMM: second output
 
     GP_mgemm,
     GP_mgemm_A,

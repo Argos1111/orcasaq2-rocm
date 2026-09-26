@@ -213,6 +213,29 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
 }
 
 
+#if defined(USE_ROCM)
+#define EXL3_GEMM2_TABLE_ROW(K) { tfp_exl3_gemm2_kernel_fp16_b##K##_cb0, tfp_exl3_gemm2_kernel_fp16_b##K##_cb1, tfp_exl3_gemm2_kernel_fp16_b##K##_cb2 }
+static fp_exl3_gemm2_kernel* const tab_gemm2_fp16[9][3] =
+{
+    { nullptr, nullptr, nullptr },
+    EXL3_GEMM2_TABLE_ROW(1), EXL3_GEMM2_TABLE_ROW(2), EXL3_GEMM2_TABLE_ROW(3), EXL3_GEMM2_TABLE_ROW(4),
+    EXL3_GEMM2_TABLE_ROW(5), EXL3_GEMM2_TABLE_ROW(6), EXL3_GEMM2_TABLE_ROW(7), EXL3_GEMM2_TABLE_ROW(8)
+};
+static fp_exl3_gemm2_kernel* const tab_gemm2_fp16_h[4] =
+    { nullptr, tfp_exl3_gemm2_kernel_fp16_h1, tfp_exl3_gemm2_kernel_fp16_h2, tfp_exl3_gemm2_kernel_fp16_h3 };
+
+fp_exl3_gemm2_kernel get_gemm2_kernel_ptr(int K, int shape_idx, int cb, bool half_k)
+{
+    if (half_k)
+    {
+        TORCH_CHECK(K >= 1 && K <= 3 && cb == 2, "No kernel for half-integer dual GEMM bitrate");
+        return tab_gemm2_fp16_h[K][shape_idx];
+    }
+    TORCH_CHECK(K >= 1 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for dual GEMM shape");
+    return tab_gemm2_fp16[K][cb][shape_idx];
+}
+#endif
+
 fp_exl3_gemm_kernel get_gemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb, bool half_k)
 {
     if (half_k)

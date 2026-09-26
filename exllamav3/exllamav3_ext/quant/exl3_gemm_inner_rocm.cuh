@@ -877,7 +877,7 @@ __host__ __device__ __forceinline__ bool rocm_ordered_fits(int num_slices, int t
 // shared inner entry point; C is [m][n] with row stride size_n. post_scale
 // applies only when shmem_out_had is set
 
-template<EXL3_GEMM_T_ARGS, bool shmem_out_had>
+template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool dual = false>
 __device__ void exl3_gemm_kernel_inner
 (
     const half* __restrict__  A,
@@ -891,7 +891,14 @@ __device__ void exl3_gemm_kernel_inner
     int size_n_stride = 0,       // full width of B and C rows when computing a column slice (0: = size_n)
     float* __restrict__ sh = nullptr,
     const half* pre_scale = nullptr,  // fused input Hadamard: A is the RAW input, rotated per segment with this scale
-    int* __restrict__ lock_base = nullptr   // ordered epilogue: base of the device lock buffer (partials + tickets); nullptr = column locks
+    int* __restrict__ lock_base = nullptr,  // ordered epilogue: base of the device lock buffer (partials + tickets); nullptr = column locks
+    // dual GEMM (gate/up fusion): a second weight matrix of the SAME k, n and K sharing A/suh,
+    // presented as column tiles [tiles_n, 2*tiles_n) of one virtual matrix. B1/C1/post_scale1
+    // replace B/C/post_scale for those tiles; C1 has the same row stride as C
+    const uint16_t* __restrict__ B1 = nullptr,
+    void* __restrict__ C1 = nullptr,
+    const half* post_scale1 = nullptr,
+    const half* pre_scale1 = nullptr   // the second matrix's own input scale (gate/up do not share suh)
 )
 {
     using namespace exl3_rocm_inner;
@@ -902,8 +909,10 @@ __device__ void exl3_gemm_kernel_inner
     float* sh_c = sh;
 
     int tiles_k = size_k / 16;                 // trellis k-subtiles (16 wide)
-    int tiles_n = size_n / TS_N;
+    const int tiles_n1 = size_n / TS_N;        // column tiles per matrix
+    int tiles_n = dual ? 2 * tiles_n1 : tiles_n1;
     int units = tiles_k * tiles_n;
+    const uint16_t* B0 = B; void* C0 = C; const half* post_scale0 = post_scale; const half* pre_scale0 = pre_scale;
     int num_slices = gridDim.x;
 #if EXL3_ROCM_SLICE_PERMUTE
     // Blocks are dispatched in index order and adjacent indices take adjacent (column, k) slices
@@ -964,6 +973,19 @@ __device__ void exl3_gemm_kernel_inner
 
         c.kt0 = seg_k0;
         c.kt1 = seg_k1;
+        // dual GEMM: virtual column tile -> (matrix, column tile within it). Compile-time: the
+        // extra live pointers pushed the single kernel into scratch spills (and scratch lowers the
+        // real co-residency below the probe's measurement -> lock-path deadlock)
+        const int vcol = col;
+        if constexpr (dual)
+        {
+            const bool second = vcol >= tiles_n1;
+            col = second ? vcol - tiles_n1 : vcol;
+            c.B = (const uint32_t*) (second ? B1 : B0);
+            C = second ? C1 : C0;
+            post_scale = second ? post_scale1 : post_scale0;
+            pre_scale = second ? pre_scale1 : pre_scale0;
+        }
         c.col = col;
         int cols = c.subs_tile * 16;
 
@@ -1040,7 +1062,7 @@ __device__ void exl3_gemm_kernel_inner
 
         int lock_i = tiles_k - seg_k1;
         int lock_d = seg_k1 - seg_k0;
-        int* lock = &locks[col];
+        int* lock = &locks[vcol];
         bool first = (lock_i == 0);
         bool last = (lock_i + lock_d == tiles_k);
 
@@ -1051,14 +1073,14 @@ __device__ void exl3_gemm_kernel_inner
             if (!whole_column)
             {
                 // slices covering this column: sid_lo..sid_hi (contiguous in slice id)
-                const int col_beg = col * tiles_k, col_end = col_beg + tiles_k;
+                const int col_beg = vcol * tiles_k, col_end = col_beg + tiles_k;
                 int sid_lo = (int) (((int64_t) col_beg * num_slices) / units);          // beg(sid_lo) <= col_beg
                 while ((int) ((int64_t) units * (sid_lo + 1) / num_slices) <= col_beg) ++sid_lo;
                 int sid_hi = (int) (((int64_t) (col_end - 1) * num_slices) / units);    // beg(sid_hi) <= col_end - 1
                 while ((int) ((int64_t) units * (sid_hi + 1) / num_slices) < col_end) ++sid_hi;
                 const int nsl = sid_hi - sid_lo + 1;
                 // publish this slice's partial to slot (col, ordinal), take the column ticket
-                float* col_slots = partials + (size_t) col * per_col * part_stride;
+                float* col_slots = partials + (size_t) vcol * per_col * part_stride;
                 float* mine = col_slots + (size_t) (sid - sid_lo) * part_stride;
                 for (int i = threadIdx.x; i < size_m * cols; i += blockDim.x) mine[i] = sh_c[i];
                 // agent-scope release fence (the ticket RMW below is acq_rel at agent scope, but
@@ -1071,7 +1093,7 @@ __device__ void exl3_gemm_kernel_inner
                 if (threadIdx.x == 0)
                 {
                     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-                    s_ticket = __hip_atomic_fetch_add(tickets + col, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    s_ticket = __hip_atomic_fetch_add(tickets + vcol, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
                 }
                 __syncthreads();
                 if (s_ticket != nsl - 1)
@@ -1079,13 +1101,13 @@ __device__ void exl3_gemm_kernel_inner
 #ifdef EXL3_ROCM_PROBE
                     { unsigned long long tpq = __probe_now(); tp_phase1 += tpa - tp0; tp_lock += tpq - tpa; tp0 = tpq; }
 #endif
-                    beg = (col + 1) * tiles_k;   // not the last arriver: done with this column
+                    beg = (vcol + 1) * tiles_k;   // not the last arriver: done with this column
                     continue;
                 }
                 // last arriver: acquire (only this block pays the L0/L1 invalidate), reset the
                 // ticket, sum the partials in slice order
                 __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
-                if (threadIdx.x == 0) __hip_atomic_store(tickets + col, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                if (threadIdx.x == 0) __hip_atomic_store(tickets + vcol, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
                 // the acquire fence above made the other slices' stores visible; plain loads, all
                 // nsl rows independent -> issued together
                 for (int i = threadIdx.x; i < size_m * cols; i += blockDim.x)
@@ -1208,7 +1230,7 @@ __device__ void exl3_gemm_kernel_inner
 #endif
 
         // phase 1 must store fresh values: the accumulate path adds into sh_c
-        beg = (col + 1) * tiles_k;
+        beg = (vcol + 1) * tiles_k;
     }
 #ifdef EXL3_ROCM_PROBE
     if (threadIdx.x == 0) { probe[0] = tp_phase1; probe[1] = tp_lock; probe[2] = tp_start; probe[3] = __probe_now(); }

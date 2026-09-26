@@ -34,6 +34,7 @@ struct BC_GatedMLP
     bool act_relu2;
     std::shared_ptr<BC_LinearEXL3> gate;
     std::shared_ptr<BC_LinearEXL3> up;
+    bool dual_recorded[MAX_BSZN] = {};   // ROCm: gate/up ran as one dual GEMM in graph [num_tokens - 1]
     std::shared_ptr<BC_LinearEXL3> down;
     float act_limit;
 
