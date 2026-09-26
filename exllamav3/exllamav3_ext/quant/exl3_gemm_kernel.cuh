@@ -11,6 +11,52 @@
 #endif
 #include "exl3_devctx.cuh"
 
+#if defined(USE_ROCM)
+// ROCm split launch (see exl3_gemm.cu): hipLaunchCooperativeKernel costs ~20 us of fixed
+// overhead on this platform (vs ~3 us for a plain launch), which dominated every decode-shaped
+// GEMM. The input Hadamard therefore runs as its own plain kernel and the GEMM body as a second
+// plain launch; the stream order between the two replaces grid.sync(). The body's column tiles
+// are assembled by the lock cascade, which only ever waits on blocks launched earlier, so it
+// needs no co-residency guarantee.
+
+__global__ void exl3_gemm_had_kernel
+(
+    const half* __restrict__ A,
+    half* __restrict__ A_had,
+    const half* __restrict__ suh,
+    const int size_k,
+    const int total_warps
+);  // defined in exl3_gemm.cu
+
+// GEMM body: A is already the Hadamard-transformed input (A_had of the caller). suh / A_had
+// parameters are kept so the argument list (and the graph parameter indices) match the
+// cooperative kernel's
+template<EXL3_GEMM_T_ARGS>
+__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
+void exl3_gemm_body_kernel(EXL3_GEMM_ARGS)
+{
+    __shared__ float inner_sh[EXL3_INNER_SH_FLOATS(TILESIZE_N)];
+    int size_m_ = size_m;
+    const half* A_ = A;
+    void* C_ = C;
+    // Each 16-row slab gets its own lock range: without grid.sync between slabs, a block that
+    // moves on to slab i + 1 must not touch counters other blocks still use for slab i
+    const int locks_per_slab = size_n / TILESIZE_N;
+    int* locks_ = locks;
+    while (size_m_ > 0)
+    {
+        exl3_gemm_kernel_inner
+        <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
+        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks_, svh, 0, inner_sh);
+        A_ += 16 * size_k;
+        if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
+        else                  C_ = (void*) (((half*) C_) + 16 * size_n);
+        size_m_ -= 16;
+        locks_ += locks_per_slab;
+    }
+}
+#endif
+
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
 void exl3_gemm_kernel(EXL3_GEMM_ARGS)

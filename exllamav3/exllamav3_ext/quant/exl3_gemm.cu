@@ -51,6 +51,29 @@ uint64_t roundup_pow2(uint64_t x)
     return x + 1;
 }
 
+#if defined(USE_ROCM)
+__global__ __launch_bounds__(256)
+void exl3_gemm_had_kernel
+(
+    const half* __restrict__ A,
+    half* __restrict__ A_had,
+    const half* __restrict__ suh,
+    const int size_k,
+    const int total_warps
+)
+{
+    int this_warp = threadIdx.x / 32 + blockDim.x / 32 * blockIdx.x;
+    if (this_warp >= total_warps) return;
+    had_hf_r_128_inner<true, false>
+    (
+        A + this_warp * 128,
+        A_had + this_warp * 128,
+        suh + (this_warp * 128) % size_k,
+        0.088388347648f  // 1/sqrt(128)
+    );
+}
+#endif
+
 uint64_t gemm_autotune_hash
 (
     int size_m,
@@ -196,6 +219,37 @@ int exl3_gemm_gr
     int shape_idx;
     fp_exl3_gemm_kernel kernel;
 
+#if defined(USE_ROCM)
+    // Split launch: input Hadamard (plain kernel) -> body (plain kernel) reading A_had as A.
+    // Graph parameter recording: the had kernel exposes GP_gemm_A (arg 0) and GP_gemm_B_suh
+    // (arg 2) and the body kernel the remaining ones; the site list below follows kernel order
+    TORCH_CHECK(A_had_ptr && suh_ptr, "exl3_gemm (ROCm): suh and A_had are required");
+    {
+        int total_warps = size_m * size_k / 128;
+        int had_blocks = CEIL_DIVIDE(total_warps, 8);
+        exl3_gemm_had_kernel<<<had_blocks, 256, 0, stream>>>(A_ptr, A_had_ptr, suh_ptr, size_k, total_warps);
+        if (graph)
+        {
+            graph->record_param((void*) exl3_gemm_had_kernel, GP_gemm_A, 0);
+            graph->record_param((void*) exl3_gemm_had_kernel, GP_gemm_A_had, 1);
+            graph->record_param((void*) exl3_gemm_had_kernel, GP_gemm_B_suh, 2);
+        }
+    }
+    const half* A_body_ptr = A_had_ptr;
+    void* kernelArgs[] =
+    {
+        (void*)& A_body_ptr,
+        (void*)& B_ptr,
+        (void*)& C_ptr,
+        (void*)& size_m,
+        (void*)& size_k,
+        (void*)& size_n,
+        (void*)& locks,
+        (void*)& suh_ptr,
+        (void*)& A_had_ptr,
+        (void*)& svh_ptr
+    };
+#else
     void* kernelArgs[] =
     {
         (void*)& A_ptr,
@@ -209,12 +263,17 @@ int exl3_gemm_gr
         (void*)& A_had_ptr,
         (void*)& svh_ptr
     };
+#endif
 
     auto add_graph_args = [&](void* kernel_ptr)
     {
         if (graph)
         {
+#if defined(USE_ROCM)
+            graph->record_param(kernel_ptr, GP_gemm_A_had, 0);
+#else
             graph->record_param(kernel_ptr, GP_gemm_A, 0);
+#endif
             graph->record_param(kernel_ptr, GP_gemm_B_trellis, 1);
             graph->record_param(kernel_ptr, GP_gemm_C, 2);
             graph->record_param(kernel_ptr, GP_gemm_B_suh, 7);
@@ -326,6 +385,9 @@ int exl3_gemm_gr
         int max_blocks = blocks_per_sm * DevCtx::instance().get_num_sms(device);
         TORCH_CHECK(num_sms <= max_blocks, "exl3_gemm: forced grid ", num_sms, " exceeds cooperative limit ", max_blocks, " for shape ", shape_idx);
     }
+#if defined(USE_ROCM)
+    cudaLaunchKernel((void*) kernel, dim3(num_sms), dim3(block_dim), kernelArgs, SMEM_MAX, stream);
+#else
     cudaLaunchCooperativeKernel
     (
         (void*) kernel,
@@ -335,6 +397,7 @@ int exl3_gemm_gr
         SMEM_MAX,
         stream
     );
+#endif
     add_graph_args((void*) kernel);
 
     cuda_check(cudaPeekAtLastError());

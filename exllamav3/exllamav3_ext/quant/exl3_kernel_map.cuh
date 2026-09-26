@@ -66,21 +66,29 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
 
 #define EXL3_GEMM_NUM_SHAPES 4
 
+// ROCm: the single-GEMM tables hold the plain-launch body kernel (exl3_gemm_body_kernel); the
+// input Hadamard runs as a separate kernel. See exl3_gemm_kernel.cuh
+#if defined(USE_ROCM)
+#define EXL3_GEMM_SINGLE_KERNEL exl3_gemm_body_kernel
+#else
+#define EXL3_GEMM_SINGLE_KERNEL exl3_gemm_kernel
+#endif
+
 // Shape 1 not currently used anywhere
 #define EXL3_GEMM_KERNEL_INSTANCES(_bits, _c_fp32, cb) \
     nullptr, \
-    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
-    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
-    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
-    exl3_gemm_kernel<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+    EXL3_GEMM_SINGLE_KERNEL<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_1>, \
+    EXL3_GEMM_SINGLE_KERNEL<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
+    EXL3_GEMM_SINGLE_KERNEL<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
+    EXL3_GEMM_SINGLE_KERNEL<_bits, false, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
 
 // Half-integer bitrates (bits + 0.5), mul1 codebook, single GEMM only (no mgemm bundles yet)
 #define EXL3_GEMM_KERNEL_INSTANCES_H(_bits, _c_fp32) \
     nullptr, \
-    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_1>, \
-    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_2>, \
-    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_3>, \
-    exl3_gemm_kernel<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_4>
+    EXL3_GEMM_SINGLE_KERNEL<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_1>, \
+    EXL3_GEMM_SINGLE_KERNEL<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_2>, \
+    EXL3_GEMM_SINGLE_KERNEL<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_3>, \
+    EXL3_GEMM_SINGLE_KERNEL<_bits, true, _c_fp32, 2, EXL3_GEMM_SHAPE_4>
 
 #define EXL3_MGEMM_KERNEL_INSTANCES_H(_bits, _c_fp32) \
     nullptr, \

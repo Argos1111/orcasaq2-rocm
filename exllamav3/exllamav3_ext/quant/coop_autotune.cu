@@ -28,6 +28,20 @@ constexpr uint64_t COOP_AUTOTUNE_VERSION = 4;
 constexpr char DISK_CACHE_MAGIC[8] = { 'E', 'X', '3', 'A', 'T', 'U', 'N', 'E' };
 constexpr uint32_t DISK_CACHE_FORMAT = 1;
 
+
+// ROCm: the exl3 GEMM kernels tuned through this class no longer need co-residency (the input
+// Hadamard is a separate launch, see exl3_gemm_kernel.cuh), and hipLaunchCooperativeKernel has
+// ~20 us of fixed overhead on RDNA3, so every tuned kernel is launched as a plain kernel.
+// CUDA keeps the cooperative launch (grid.sync inside the kernels)
+static inline cudaError_t coop_launch(void* kernel, dim3 grid, dim3 block, void** args, size_t smem, cudaStream_t stream)
+{
+#if defined(USE_ROCM)
+    return cudaLaunchKernel(kernel, grid, block, args, smem, stream);
+#else
+    return cudaLaunchCooperativeKernel(kernel, grid, block, args, smem, stream);
+#endif
+}
+
 struct ExpandedCandidate
 {
     void* kernel;
@@ -407,7 +421,7 @@ void measure_candidate_sample
     cuda_check(cudaEventRecord(start, stream));
     for (int i = 0; i < repeats; ++i)
     {
-        cuda_check(cudaLaunchCooperativeKernel
+        cuda_check(coop_launch
         (
             candidate.kernel,
             dim3(candidate.num_sms, 1, candidate.concurrency),
@@ -465,7 +479,7 @@ void measure_stage
         set_kernel_attr_once(candidate.kernel, smem);
 
         // One untimed launch avoids first-use effects from contaminating the first measured round.
-        cuda_check(cudaLaunchCooperativeKernel
+        cuda_check(coop_launch
         (
             candidate.kernel,
             dim3(candidate.num_sms, 1, candidate.concurrency),
@@ -607,7 +621,7 @@ bool CoopKernelAutotuner::launch_locked
     }
 
     set_kernel_attr_once(launch_config.kernel, smem);
-    cuda_check(cudaLaunchCooperativeKernel
+    cuda_check(coop_launch
     (
         launch_config.kernel,
         dim3(launch_config.num_sms, 1, launch_config.concurrency),
@@ -641,7 +655,7 @@ CoopAutotuneLaunch CoopKernelAutotuner::launch
     {
         launch_cache[salted_hash] = launch_config;
         set_kernel_attr_once(launch_config.kernel, smem);
-        cuda_check(cudaLaunchCooperativeKernel
+        cuda_check(coop_launch
         (
             launch_config.kernel,
             dim3(launch_config.num_sms, 1, launch_config.concurrency),
@@ -661,7 +675,7 @@ CoopAutotuneLaunch CoopKernelAutotuner::launch
     store_disk_cache(salted_hash, launch_config);
 
     set_kernel_attr_once(launch_config.kernel, smem);
-    cuda_check(cudaLaunchCooperativeKernel
+    cuda_check(coop_launch
     (
         launch_config.kernel,
         dim3(launch_config.num_sms, 1, launch_config.concurrency),
