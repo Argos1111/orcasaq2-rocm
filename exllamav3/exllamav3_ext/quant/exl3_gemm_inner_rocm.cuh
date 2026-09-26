@@ -32,7 +32,9 @@
 #ifndef EXL3_ROCM_FUSED_HAD
 #define EXL3_ROCM_FUSED_HAD 1
 #endif
-#define EXL3_X_LDS_TILES 128                                 // 2048 k
+#ifndef EXL3_X_LDS_TILES
+#define EXL3_X_LDS_TILES 256                                 // 4096 k: 8 KB LDS; 128 forced min grids of 100-400 blocks on the 5120-k shapes (measured: 256 +1 tok/s, 384/512 lose occupancy)
+#endif
 #define EXL3_X_LDS_FLOATS (EXL3_X_LDS_TILES * 16 / 2)        // fp16 halves stored as floats/2
 // 1: deterministic in-block k-split reduction (slots + ordered sum) instead of LDS atomicAdd
 #ifndef EXL3_ROCM_DET_KSPLIT
