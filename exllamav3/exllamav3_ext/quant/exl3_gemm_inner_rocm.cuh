@@ -64,6 +64,9 @@ __device__ __forceinline__ float decode_w_mul1(uint32_t code)
 // quarter-rate v_dot4. With the accumulator 0x6400 the result's low half is the fp16 value
 // 1024 + bytesum exactly, which feeds v_fma_mix_f32 directly; the affine correction
 // (k_inv, k_bias * sum(x)) is applied once per output instead of once per weight
+#ifndef EXL3_ROCM_ILV
+#define EXL3_ROCM_ILV 8     // codes decoded in lock-step per stage (see phase1_lane)
+#endif
 #ifndef EXL3_ROCM_PIPELINE
 #define EXL3_ROCM_PIPELINE 1
 #endif
@@ -331,8 +334,10 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
 
     for (int idx = rem; idx < items * KS; idx += groups)
     {
-        int item = idx / KS;
-        int ks = idx - item * KS;
+        // adjacent groups of a wave take adjacent subtiles of the same k range (wave-coherent
+        // trellis rows and a wave-uniform x slice: measured ~7% faster than adjacent k-splits)
+        int ks = idx / items;
+        int item = idx - ks * items;
         int s_ = item % c.subs_tile;
         int n = c.col * c.subs_tile + s_;
         int m = item / c.subs_tile;
@@ -394,11 +399,11 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
                 // are volatile so the compiler cannot re-serialise them per code
                 float b0 = 0.f, b1 = 0.f;
                 #pragma unroll
-                for (int i0 = 0; i0 < 32; i0 += 8)
+                for (int i0 = 0; i0 < 32; i0 += EXL3_ROCM_ILV)
                 {
-                    uint32_t code[8], t[8];
+                    uint32_t code[EXL3_ROCM_ILV], t[EXL3_ROCM_ILV];
                     #pragma unroll
-                    for (int j = 0; j < 8; ++j)
+                    for (int j = 0; j < EXL3_ROCM_ILV; ++j)
                     {
                         const int E = lane_e_rel<bits, half_k>(i0 + j);
                         const int p = (E - 1) >> 5;
@@ -406,13 +411,13 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
                         code[j] = __funnelshift_r(a[p + 1], a[p], sh);
                     }
                     #pragma unroll
-                    for (int j = 0; j < 8; ++j) asm volatile("v_mad_u32_u16 %0, %1, %2, 0" : "=v"(t[j]) : "v"(code[j]), "s"(0xD12Du));
+                    for (int j = 0; j < EXL3_ROCM_ILV; ++j) asm volatile("v_mad_u32_u16 %0, %1, %2, 0" : "=v"(t[j]) : "v"(code[j]), "s"(0xD12Du));
                     #pragma unroll
-                    for (int j = 0; j < 8; ++j) asm volatile("v_mad_u16 %0, %1, %2, %0 op_sel:[0,0,1,1]" : "+v"(t[j]) : "v"(code[j]), "s"(0x83DCu));
+                    for (int j = 0; j < EXL3_ROCM_ILV; ++j) asm volatile("v_mad_u16 %0, %1, %2, %0 op_sel:[0,0,1,1]" : "+v"(t[j]) : "v"(code[j]), "s"(0x83DCu));
                     #pragma unroll
-                    for (int j = 0; j < 8; ++j) asm volatile("v_sad_u8 %0, %0, 0, 0x6400" : "+v"(t[j]));
+                    for (int j = 0; j < EXL3_ROCM_ILV; ++j) asm volatile("v_sad_u8 %0, %0, 0, 0x6400" : "+v"(t[j]));
                     #pragma unroll
-                    for (int j = 0; j < 8; ++j)
+                    for (int j = 0; j < EXL3_ROCM_ILV; ++j)
                     {
                         const int i = i0 + j;
                         const int g = i >> 3, k = i & 7;
