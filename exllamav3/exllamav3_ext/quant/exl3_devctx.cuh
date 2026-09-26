@@ -14,6 +14,15 @@
 #define MOE_SCHED_OFFSET (MAX_TILES_C + 2 * MAX_BARRIERS)
 #define MOE_SCHED_INTS (2 + MOE_MAX_GROUPS)
 
+// ROCm ordered-partials GEMM epilogue (exl3_gemm_inner_rocm.cuh): fp32 partial tiles laid out
+// [column][slice ordinal][size_m x TS_N] after the MoE scheduler state, then per-column arrival
+// tickets. 8 MB: e.g. 136 columns x 16 slices x 16 x 128... the inner checks the fit per call
+#define ROCM_PARTIALS_OFFSET (MOE_SCHED_OFFSET + MOE_SCHED_INTS + 62)   // 64-int aligned
+#define ROCM_PARTIALS_PER_COL 32
+#define ROCM_PARTIALS_FLOATS (2 * 1024 * 1024)
+#define ROCM_TICKETS_OFFSET (ROCM_PARTIALS_OFFSET + ROCM_PARTIALS_FLOATS)
+#define ROCM_TICKETS_INTS MAX_TILES_C
+
 // Workspace size
 #define WORKSPACE_SIZE (16*1024*1024)
 

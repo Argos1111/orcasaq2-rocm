@@ -34,7 +34,17 @@
 #endif
 #define EXL3_X_LDS_TILES 128                                 // 2048 k
 #define EXL3_X_LDS_FLOATS (EXL3_X_LDS_TILES * 16 / 2)        // fp16 halves stored as floats/2
-#define EXL3_INNER_SH_FLOATS(ts_n) (16 * (ts_n) + (EXL3_ROCM_FUSED_HAD ? EXL3_X_LDS_FLOATS : 0))
+// 1: deterministic in-block k-split reduction (slots + ordered sum) instead of LDS atomicAdd
+#ifndef EXL3_ROCM_DET_KSPLIT
+#define EXL3_ROCM_DET_KSPLIT 1
+#endif
+// 1: ordered-partials epilogue (no inter-block waiting) for size_m <= 16; 0: column locks
+#ifndef EXL3_ROCM_ORDERED_EPILOGUE
+#define EXL3_ROCM_ORDERED_EPILOGUE 1
+#endif
+// k-split slots (EXL3_ROCM_DET_KSPLIT): one 16-float slot per 8-lane group, max 512 threads = 64 groups
+#define EXL3_KSLOT_FLOATS (64 * 16)
+#define EXL3_INNER_SH_FLOATS(ts_n) (16 * (ts_n) + (EXL3_ROCM_FUSED_HAD ? EXL3_X_LDS_FLOATS : 0) + ((EXL3_ROCM_DET_KSPLIT || EXL3_ROCM_ORDERED_EPILOGUE) ? EXL3_KSLOT_FLOATS : 0))
 
 // 1: route the 4/6-bit mul1 tensors through the generic k-split lane tier as well
 #ifndef EXL3_ROCM_LANE_TIER_ALL
@@ -369,7 +379,15 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
 
     // (barrier first: the previous column tile's write-out may still be reading sh_c)
     __syncthreads();
+#if EXL3_ROCM_DET_KSPLIT
+    // deterministic k-split reduction: each (item, ks) chain writes its 16 outputs to its own LDS
+    // slot (KS * items = groups slots, region after sh_c and the x slice), summed in ks order after
+    float* kslots = c.sh_c + 16 * c.subs_tile * 16 + (EXL3_ROCM_FUSED_HAD ? EXL3_X_LDS_FLOATS : 0);
+    if (KS == 1)
+        for (int i = threadIdx.x; i < c.size_m * cols; i += blockDim.x) c.sh_c[i] = 0.f;
+#else
     for (int i = threadIdx.x; i < c.size_m * cols; i += blockDim.x) c.sh_c[i] = 0.f;
+#endif
     __syncthreads();
 
     const int base_bit = LANE_BITS * lane;
@@ -737,10 +755,30 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
         }
         else
         {
+#if EXL3_ROCM_DET_KSPLIT
+            float* slot = kslots + (size_t) idx * 16;   // idx = ks * items + item
+            slot[lane] = acc0;
+            slot[lane + 8] = acc1;
+#else
             atomicAdd(out + lane, acc0);
             atomicAdd(out + lane + 8, acc1);
+#endif
         }
     }
+#if EXL3_ROCM_DET_KSPLIT
+    if (KS > 1)
+    {
+        __syncthreads();
+        for (int i = threadIdx.x; i < items * 16; i += blockDim.x)
+        {
+            const int item = i >> 4, e = i & 15;
+            float s = 0.f;
+            for (int ks = 0; ks < KS; ++ks) s += kslots[(size_t) (ks * items + item) * 16 + e];
+            const int s_ = item % c.subs_tile, m = item / c.subs_tile;
+            c.sh_c[(size_t) m * cols + (size_t) s_ * 16 + e] = s;
+        }
+    }
+#endif
 }
 
 // Tier C: everything else. One warp per subtile through dq_dispatch
@@ -820,6 +858,20 @@ __device__ __forceinline__ void phase1_dq(SegCtx& c)
 
 }  // namespace exl3_rocm_inner
 
+// Ordered-partials epilogue capacity test, shared by the inner (device) and the host grid bound:
+// both must agree, otherwise the host could offer a grid beyond co-residency to a lock-path call
+__host__ __device__ __forceinline__ int rocm_ordered_per_col(int num_slices, int tiles_n)
+{
+    return (num_slices + tiles_n - 1) / tiles_n + 1;
+}
+__host__ __device__ __forceinline__ bool rocm_ordered_fits(int num_slices, int tiles_n, int size_m, int ts_n)
+{
+    if (size_m > 16) return false;
+    const int per_col = rocm_ordered_per_col(num_slices, tiles_n);
+    if (per_col > ROCM_PARTIALS_PER_COL) return false;
+    return (size_t) tiles_n * per_col * size_m * ts_n <= (size_t) ROCM_PARTIALS_FLOATS;
+}
+
 // shared inner entry point; C is [m][n] with row stride size_n. post_scale
 // applies only when shmem_out_had is set
 
@@ -836,7 +888,8 @@ __device__ void exl3_gemm_kernel_inner
     const half* post_scale,
     int size_n_stride = 0,       // full width of B and C rows when computing a column slice (0: = size_n)
     float* __restrict__ sh = nullptr,
-    const half* pre_scale = nullptr   // fused input Hadamard: A is the RAW input, rotated per segment with this scale
+    const half* pre_scale = nullptr,  // fused input Hadamard: A is the RAW input, rotated per segment with this scale
+    int* __restrict__ lock_base = nullptr   // ordered epilogue: base of the device lock buffer (partials + tickets); nullptr = column locks
 )
 {
     using namespace exl3_rocm_inner;
@@ -864,6 +917,26 @@ __device__ void exl3_gemm_kernel_inner
 #endif
     int beg = (int) ((int64_t) units * sid / num_slices);
     int end = (int) ((int64_t) units * (sid + 1) / num_slices);
+
+#if EXL3_ROCM_ORDERED_EPILOGUE
+    // Ordered-partials epilogue: every slice stores its fp32 partial tile to partials[sid] and
+    // takes a ticket on the column; the LAST arriver sums the column's partials in slice order
+    // (deterministic) and writes the output. No block ever waits for another one -> no
+    // co-residency requirement, and the k-chain of dependent round trips becomes one. One
+    // 16-row slab only (the partials are indexed by slice, not by slab): the host passes
+    // lock_base only when size_m <= 16
+    // slot layout: [col][ordinal within the column][size_m x TS_N]; at most ROCM_PARTIALS_PER_COL
+    // slices per column (the host caps the grid so that ceil(num_slices / tiles_n) + 1 fits).
+    // Compact and reused across calls -> stays L2-resident (a per-slice layout over the whole
+    // buffer was ~2 us slower per GEMM: cold lines)
+    const int per_col = rocm_ordered_per_col(num_slices, tiles_n);
+    const bool ordered = (lock_base != nullptr) && rocm_ordered_fits(num_slices, tiles_n, size_m, TS_N);
+    float* partials = ordered ? (float*) (lock_base + ROCM_PARTIALS_OFFSET) : nullptr;
+    int* tickets = ordered ? (lock_base + ROCM_TICKETS_OFFSET) : nullptr;
+    const int part_stride = size_m * TS_N;   // floats per slot
+#else
+    const bool ordered = false;
+#endif
 
     SegCtx c;
     c.A = A;
@@ -966,13 +1039,70 @@ __device__ void exl3_gemm_kernel_inner
         int lock_i = tiles_k - seg_k1;
         int lock_d = seg_k1 - seg_k0;
         int* lock = &locks[col];
-        lock_acquire(lock, lock_i);
-#ifdef EXL3_ROCM_PROBE
-        unsigned long long tpb = __probe_now();
-#endif
-
         bool first = (lock_i == 0);
         bool last = (lock_i + lock_d == tiles_k);
+
+#if EXL3_ROCM_ORDERED_EPILOGUE
+        if (ordered)
+        {
+            const bool whole_column = first && last;   // single slice covers the column: no partials
+            if (!whole_column)
+            {
+                // slices covering this column: sid_lo..sid_hi (contiguous in slice id)
+                const int col_beg = col * tiles_k, col_end = col_beg + tiles_k;
+                int sid_lo = (int) (((int64_t) col_beg * num_slices) / units);          // beg(sid_lo) <= col_beg
+                while ((int) ((int64_t) units * (sid_lo + 1) / num_slices) <= col_beg) ++sid_lo;
+                int sid_hi = (int) (((int64_t) (col_end - 1) * num_slices) / units);    // beg(sid_hi) <= col_end - 1
+                while ((int) ((int64_t) units * (sid_hi + 1) / num_slices) < col_end) ++sid_hi;
+                const int nsl = sid_hi - sid_lo + 1;
+                // publish this slice's partial to slot (col, ordinal), take the column ticket
+                float* col_slots = partials + (size_t) col * per_col * part_stride;
+                float* mine = col_slots + (size_t) (sid - sid_lo) * part_stride;
+                for (int i = threadIdx.x; i < size_m * cols; i += blockDim.x) mine[i] = sh_c[i];
+                // agent-scope release fence (the ticket RMW below is acq_rel at agent scope, but
+                // the partial stores by the OTHER threads must be ordered before it: block barrier
+                // then a single release fence by the ticket thread)
+                __syncthreads();
+                // ticket broadcast through the k-split slot area (free after phase 1; keeps the
+                // static LDS size unchanged)
+                int& s_ticket = *(int*) (sh_c + 16 * TS_N + (EXL3_ROCM_FUSED_HAD ? EXL3_X_LDS_FLOATS : 0));
+                if (threadIdx.x == 0)
+                {
+                    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+                    s_ticket = __hip_atomic_fetch_add(tickets + col, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                }
+                __syncthreads();
+                if (s_ticket != nsl - 1)
+                {
+#ifdef EXL3_ROCM_PROBE
+                    { unsigned long long tpq = __probe_now(); tp_phase1 += tpa - tp0; tp_lock += tpq - tpa; tp0 = tpq; }
+#endif
+                    beg = (col + 1) * tiles_k;   // not the last arriver: done with this column
+                    continue;
+                }
+                // last arriver: acquire (only this block pays the L0/L1 invalidate), reset the
+                // ticket, sum the partials in slice order
+                __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+                if (threadIdx.x == 0) __hip_atomic_store(tickets + col, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                // the acquire fence above made the other slices' stores visible; plain loads, all
+                // nsl rows independent -> issued together
+                for (int i = threadIdx.x; i < size_m * cols; i += blockDim.x)
+                {
+                    float s = col_slots[i];
+                    #pragma unroll 4
+                    for (int q = 1; q < nsl; ++q) s += col_slots[(size_t) q * part_stride + i];
+                    sh_c[i] = s;
+                }
+                __syncthreads();
+            }
+            first = true; last = true;   // fall through to the final-block output path below
+        }
+        else
+#endif
+        lock_acquire(lock, lock_i);
+#ifdef EXL3_ROCM_PROBE
+        unsigned long long tpb = __probe_now();   // ordered: includes partial publish + ticket + (last) gather
+#endif
 
         if (!first)
         {
@@ -1066,6 +1196,9 @@ __device__ void exl3_gemm_kernel_inner
             }
         }
 
+#if EXL3_ROCM_ORDERED_EPILOGUE
+        if (!ordered)
+#endif
         lock_release(lock, lock_d, last);
 #ifdef EXL3_ROCM_PROBE
         unsigned long long tpc = __probe_now();

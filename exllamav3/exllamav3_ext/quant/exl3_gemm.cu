@@ -104,6 +104,31 @@ static inline int exl3_rocm_fused_had_min_grid(int size_m, int size_k, int size_
 #define GEMM_DYN_SMEM SMEM_MAX
 #endif
 
+#if defined(USE_ROCM)
+// Grid bound (blocks per CU) for the plain-launched body kernel. With the ordered-partials epilogue
+// (EXL3_ROCM_ORDERED_EPILOGUE, size_m <= 16) no block waits for another, so the grid may exceed the
+// co-residency limit; EXL3_ROCM_OVERSUB (default 1: grids beyond the bound measured slower in the
+// real decode chain on gfx1100 even when they win in isolation) x the measured bound is offered to the
+// autotuner. Multi-slab calls (size_m > 16) keep the column locks and the hard bound
+static inline int rocm_gemm_blocks_per_cu(const void* kernel, int block_dim, int smem, int size_m, int size_n, int tilesize_n, int num_cus)
+{
+    int bps = rocm_coresident_blocks_per_cu(kernel, block_dim, smem);
+#if EXL3_ROCM_ORDERED_EPILOGUE
+    if (size_m <= 16)
+    {
+        static const int oversub = getenv("EXL3_ROCM_OVERSUB") ? atoi(getenv("EXL3_ROCM_OVERSUB")) : 1;
+        // the largest grid the ordered epilogue can serve for this shape (same test as the inner);
+        // beyond it the kernel falls back to the locks and the hard bound applies
+        int over = MAX(oversub, 1);
+        while (over > 1 && !rocm_ordered_fits(num_cus * bps * over, size_n / tilesize_n, size_m, tilesize_n)) --over;
+        if (over > 1 || rocm_ordered_fits(num_cus * bps, size_n / tilesize_n, size_m, tilesize_n)) bps *= over;
+        // (if even 1x the bound does not fit the ordered buffer, the lock path runs at the bound)
+    }
+#endif
+    return MAX(MIN(bps, 12), 1);
+}
+#endif
+
 uint64_t gemm_autotune_hash
 (
     int size_m,
@@ -275,10 +300,10 @@ int exl3_gemm_gr
             if (!exl3_gemm_shape_compat(si, size_m, size_k, size_n, K) || fused_min_grid[si] < 0) continue;
             fp_exl3_gemm_kernel kf = get_gemm_kernel_ptr(K, si, c_fp32, cb, half_k);
             if (!kf) continue;
-            int bps = rocm_coresident_blocks_per_cu((const void*) kf, exl3_gemm_blockdim_g[si], GEMM_DYN_SMEM);
+            int bps = rocm_gemm_blocks_per_cu((const void*) kf, exl3_gemm_blockdim_g[si], GEMM_DYN_SMEM, size_m, size_n, exl3_gemm_tilesize_n_g[si], num_sms);
             int tilesize_k = exl3_gemm_tilesize_k_g[si];
             int max_slices = MAX(size_k / tilesize_k * size_n / exl3_gemm_tilesize_n_g[si], 1);
-            int cap = MIN(max_slices, num_sms * MAX(MIN(bps, 12), 1));
+            int cap = MIN(max_slices, num_sms * bps);
             if (fused_min_grid[si] <= cap) any = true;
         }
         fused_had = any;
@@ -405,12 +430,12 @@ int exl3_gemm_gr
             // MEASURED co-residency limit (the column lock deadlocks - and hangs the GPU - if any
             // block of the grid is not resident; the occupancy API is not that bound on gfx11)
             {
-                int blocks_per_sm = rocm_coresident_blocks_per_cu
+                int blocks_per_sm = rocm_gemm_blocks_per_cu
                 (
                     (const void*) candidate_kernel,
-                    exl3_gemm_blockdim_g[candidate_shape_idx], GEMM_DYN_SMEM
+                    exl3_gemm_blockdim_g[candidate_shape_idx], GEMM_DYN_SMEM, size_m, size_n, tilesize_n, num_sms
                 );
-                grid_cap = num_sms * MAX(MIN(blocks_per_sm, 12), 1);
+                grid_cap = num_sms * blocks_per_sm;
             }
 #endif
             int max_candidate_sms = MAX(MIN(max_slices, grid_cap), 1);
@@ -465,7 +490,7 @@ int exl3_gemm_gr
         // instead of a GPU deadlock. EXL3_ROCM_UNSAFE_GRID=1 bypasses (co-residency experiments)
 #if defined(USE_ROCM)
         static const bool unsafe = getenv("EXL3_ROCM_UNSAFE_GRID") != nullptr;
-        int blocks_per_sm = rocm_coresident_blocks_per_cu((const void*) kernel, block_dim, GEMM_DYN_SMEM);
+        int blocks_per_sm = rocm_gemm_blocks_per_cu((const void*) kernel, block_dim, GEMM_DYN_SMEM, size_m, size_n, exl3_gemm_tilesize_n_g[shape_idx], DevCtx::instance().get_num_sms(device));
 #else
         const bool unsafe = false;
         int blocks_per_sm = 1;

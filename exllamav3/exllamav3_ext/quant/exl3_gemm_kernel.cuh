@@ -47,7 +47,8 @@ void exl3_gemm_body_kernel(EXL3_GEMM_ARGS)
     {
         exl3_gemm_kernel_inner
         <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
-        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks_, svh, 0, inner_sh, suh);
+        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks_, svh, 0, inner_sh, suh,
+         size_m <= 16 ? locks : nullptr);   // ordered epilogue only for a single slab
         A_ += 16 * size_k;
         if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
         else                  C_ = (void*) (((half*) C_) + 16 * size_n);
