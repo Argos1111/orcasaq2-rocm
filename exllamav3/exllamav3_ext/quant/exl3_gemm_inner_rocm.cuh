@@ -73,13 +73,14 @@ __device__ __forceinline__ float decode_w_mul1(uint32_t code)
 __device__ __forceinline__ uint32_t mul1_h1024(uint32_t code)
 {
 #if EXL3_ROCM_FAST_MUL1
-    // Two full-rate 16-bit multiplies via intrinsics (no inline asm: hand-written asm with tied
-    // operands mis-scheduled in the interleaved loop of the half-integer instances):
-    //   lo24(code) * 0xD12D  (v_mul_u32_u24)  +  (lo16(code) * 0x83DC) << 16  (v_mul_lo_u16 + shift-add)
-    const uint32_t c16 = code & 0xFFFFu;
-    const uint32_t lo = __umul24(c16, 0xD12Du);
-    const uint32_t hi = (uint32_t) (uint16_t) ((uint16_t) c16 * (uint16_t) 0x83DCu);
-    const uint32_t t = lo + (hi << 16);
+    // Two full-rate 16-bit multiplies in one asm statement (the compiler folds the C form back
+    // into a quarter-rate v_mul_lo_u32 + v_and):
+    //   t  = lo16(code) * 0xD12D                    (v_mad_u32_u16, full 32-bit product)
+    //   t += (lo16(code) * 0x83DC) << 16            (v_mad_u16 into the high half via op_sel)
+    //   == code * 0x83DCD12D mod 2^32; only the low 16 bits of `code` are read
+    uint32_t t;
+    asm("v_mad_u32_u16 %0, %1, %2, 0\n\tv_mad_u16 %0, %1, %3, %0 op_sel:[0,0,1,1]"
+        : "=&v"(t) : "v"(code), "s"(0xD12Du), "s"(0x83DCu));
     return __builtin_amdgcn_sad_u8(t, 0u, 0x6400u);
 #else
     const uint32_t p = (code & 0xFFFFu) * 0x83DCD12Du;
@@ -385,20 +386,43 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
                     xh[2 * i]     = __ushort_as_half((unsigned short) (xw[i] & 0xFFFFu));
                     xh[2 * i + 1] = __ushort_as_half((unsigned short) (xw[i] >> 16));
                 }
+                // Explicitly interleaved decode: the per-code chain (alignbit -> mad -> mad -> sad
+                // -> fma) is 5 dependent ops with ~4-cycle result latency each, and the compiler's
+                // schedule left those latencies exposed (~50% VALU utilisation). Processing 8 codes
+                // in lock-step, one stage at a time, keeps 8 independent ops between dependent hops
+                // (measured 1.5 -> 2.6 T weights/s in micro/decode_rate9.hip). The inline-asm stages
+                // are volatile so the compiler cannot re-serialise them per code
+                float b0 = 0.f, b1 = 0.f;
                 #pragma unroll
-                for (int i = 0; i < 32; ++i)
+                for (int i0 = 0; i0 < 32; i0 += 8)
                 {
-                    const int E = lane_e_rel<bits, half_k>(i);
-                    const int p = (E - 1) >> 5;
-                    const int sh = 32 * (p + 1) - E;
-                    uint32_t code = __funnelshift_r(a[p + 1], a[p], sh);    // low 16 bits = code
-                    uint32_t h = mul1_h1024(code);
-                    half wh = __ushort_as_half((unsigned short) h);
-                    const int g = i >> 3, k = i & 7;
-                    const int r = 2 * g + (k & 1) + 8 * ((k >> 1) & 1);
-                    if (k < 4) acc0 = fmaf(__half2float(wh), __half2float(xh[r]), acc0);
-                    else       acc1 = fmaf(__half2float(wh), __half2float(xh[r]), acc1);
+                    uint32_t code[8], t[8];
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                    {
+                        const int E = lane_e_rel<bits, half_k>(i0 + j);
+                        const int p = (E - 1) >> 5;
+                        const int sh = 32 * (p + 1) - E;
+                        code[j] = __funnelshift_r(a[p + 1], a[p], sh);
+                    }
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) asm volatile("v_mad_u32_u16 %0, %1, %2, 0" : "=v"(t[j]) : "v"(code[j]), "s"(0xD12Du));
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) asm volatile("v_mad_u16 %0, %1, %2, %0 op_sel:[0,0,1,1]" : "+v"(t[j]) : "v"(code[j]), "s"(0x83DCu));
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j) asm volatile("v_sad_u8 %0, %0, 0, 0x6400" : "+v"(t[j]));
+                    #pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                    {
+                        const int i = i0 + j;
+                        const int g = i >> 3, k = i & 7;
+                        const int r = 2 * g + (k & 1) + 8 * ((k >> 1) & 1);
+                        const float pr = __half2float(__ushort_as_half((unsigned short) t[j])) * __half2float(xh[r]);
+                        if (k < 4) { if (k & 1) b0 += pr; else acc0 += pr; }
+                        else       { if (k & 1) b1 += pr; else acc1 += pr; }
+                    }
                 }
+                acc0 += b0; acc1 += b1;
                 float sx = 0.f;
                 #pragma unroll
                 for (int i = 0; i < 16; ++i) sx += __half2float(xh[i]);
