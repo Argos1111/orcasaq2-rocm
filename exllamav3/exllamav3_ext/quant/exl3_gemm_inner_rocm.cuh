@@ -415,6 +415,7 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
 
             if constexpr (cb == 2)
             {
+#if !EXL3_ROCM_PAIRED_DOT2
                 half xh[16];
                 #pragma unroll
                 for (int i = 0; i < 8; ++i)
@@ -422,6 +423,7 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
                     xh[2 * i]     = __ushort_as_half((unsigned short) (xw[i] & 0xFFFFu));
                     xh[2 * i + 1] = __ushort_as_half((unsigned short) (xw[i] >> 16));
                 }
+#endif
                 // Explicitly interleaved decode: the per-code chain (alignbit -> mad -> mad -> sad
                 // -> fma) is 5 dependent ops with ~4-cycle result latency each, and the compiler's
                 // schedule left those latencies exposed (~50% VALU utilisation). Processing 8 codes
@@ -483,10 +485,16 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
 #endif
                 }
                 acc0 += b0; acc1 += b1;
+#if EXL3_ROCM_PAIRED_DOT2
+                // sum of the tile's activations (affine correction) straight from the packed pairs
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) asm volatile("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(xsum) : "v"(xw[i]), "s"(0x3c003c00u));
+#else
                 float sx = 0.f;
                 #pragma unroll
                 for (int i = 0; i < 16; ++i) sx += __half2float(xh[i]);
                 xsum += sx;
+#endif
             }
             else
             {
