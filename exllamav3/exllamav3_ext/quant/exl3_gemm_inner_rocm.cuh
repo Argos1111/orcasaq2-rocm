@@ -404,8 +404,21 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
                 #pragma unroll
                 for (int k = 0; k < NW; ++k) a[k + 1] = p32[bw + k];
             }
-            const uint4* xp = (const uint4*) (x + (t - x_t0) * 16);
-            uint4 x0 = xp[0], x1 = xp[1];
+            if (c.xl)
+            {
+                // LDS: read through the local address space so the loads lower to ds_load_b128
+                // (a pointer that may be either LDS or global is lowered to flat_load)
+                typedef __attribute__((address_space(3))) const uint32_t lds_u32;
+                lds_u32* xp = (lds_u32*) (const uint32_t*) (x + (t - x_t0) * 16);
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) xw[k] = xp[k];
+                return;
+            }
+            typedef __attribute__((address_space(1))) const uint4 gl_uint4;
+            gl_uint4* xp = (gl_uint4*) (const uint4*) (x + t * 16);
+            uint4 x0, x1;
+            x0.x = xp[0].x; x0.y = xp[0].y; x0.z = xp[0].z; x0.w = xp[0].w;
+            x1.x = xp[1].x; x1.y = xp[1].y; x1.z = xp[1].z; x1.w = xp[1].w;
             xw[0] = x0.x; xw[1] = x0.y; xw[2] = x0.z; xw[3] = x0.w;
             xw[4] = x1.x; xw[5] = x1.y; xw[6] = x1.z; xw[7] = x1.w;
         };
