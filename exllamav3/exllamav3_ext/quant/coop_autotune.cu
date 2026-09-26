@@ -247,6 +247,7 @@ bool launch_from_disk_cache
         if (candidate.tag != record.tag) continue;
         if (candidate.block_dim != record.block_dim) continue;
         if (record.num_sms < 1 || record.num_sms > candidate.max_num_sms) continue;
+        if (record.num_sms < candidate.min_num_sms) continue;
 
         int max_concurrency = MAX(candidate.max_concurrency, 1);
         int total_sms = candidate.total_sms > 0 ? candidate.total_sms : candidate.max_num_sms;
@@ -535,6 +536,8 @@ CoopAutotuneLaunch tune
     {
         int total_tiles = numel_B / base.block_dim / 16;
         int min_num_sms = MAX(2, MIN(total_tiles / 32, base.max_num_sms) / base.max_concurrency / 2 * 2);
+        min_num_sms = MAX(min_num_sms, base.min_num_sms);
+        TORCH_CHECK(min_num_sms <= base.max_num_sms, "CoopKernelAutotuner: candidate grid bound exceeds its maximum");
 
         TORCH_CHECK(base.kernel, "CoopKernelAutotuner: null kernel candidate");
         TORCH_CHECK(base.block_dim > 0, "CoopKernelAutotuner: invalid block_dim");
@@ -542,7 +545,7 @@ CoopAutotuneLaunch tune
         int max_concurrency = MAX(base.max_concurrency, 1);
         int total_sms = base.total_sms > 0 ? base.total_sms : base.max_num_sms;
 
-        if (max_concurrency > 1 || base.max_num_sms == 1)
+        if ((max_concurrency > 1 || base.max_num_sms == 1) && base.min_num_sms <= 1)
         {
             int concurrency = MAX(MIN(total_sms, max_concurrency), 1);
             candidates.push_back({ base.kernel, base.block_dim, 1, concurrency, base.tag, 0.0f, {} });

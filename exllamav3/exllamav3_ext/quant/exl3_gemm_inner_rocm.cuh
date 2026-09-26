@@ -24,7 +24,17 @@
 
 // staged in shared memory, declared once per kernel: per-instantiation __shared__
 // would request the LDS once per instantiation
-#define EXL3_INNER_SH_FLOATS(ts_n) (16 * (ts_n))
+// Fused input Hadamard (EXL3_ROCM_FUSED_HAD): each block rotates the x slice of its k segment
+// into LDS instead of a separate Hadamard kernel writing A_had to global memory. Segment length
+// is bounded by the autotuned grid (<= ~230 k tiles for the shapes in use); larger segments fall
+// back to a per-tile in-register rotation path... no: they are split by the host (see
+// exl3_gemm.cu), so the LDS slice always suffices. Budget: EXL3_X_LDS_TILES k tiles per m row
+#ifndef EXL3_ROCM_FUSED_HAD
+#define EXL3_ROCM_FUSED_HAD 1
+#endif
+#define EXL3_X_LDS_TILES 256                                 // 4096 k
+#define EXL3_X_LDS_FLOATS (EXL3_X_LDS_TILES * 16 / 2)        // fp16 halves stored as floats/2
+#define EXL3_INNER_SH_FLOATS(ts_n) (16 * (ts_n) + (EXL3_ROCM_FUSED_HAD ? EXL3_X_LDS_FLOATS : 0))
 
 // 1: route the 4/6-bit mul1 tensors through the generic k-split lane tier as well
 #ifndef EXL3_ROCM_LANE_TIER_ALL
@@ -133,6 +143,7 @@ struct SegCtx
 {
     const half* __restrict__ A;
     const uint32_t* __restrict__ B;
+    const half* __restrict__ xl;    // fused-had: rotated x slice in LDS, [m][ (kt1-kt0)*16 ] (nullptr: read A)
     float* __restrict__ sh_c;       // [16][cols] segment partial
     int size_m;
     int size_k;
@@ -346,7 +357,11 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
 
         const uint32_t* base =
             (const uint32_t*) c.B + (size_t) c.kt0 * (c.nsub_total * SUB_U32) + (size_t) n * SUB_U32;
-        const half* x = c.A + (size_t) m * c.size_k;
+        // x: LDS slice (fused had, indexed from the segment start) or the global rotated A
+        const int seg_k = (c.kt1 - c.kt0) * 16;
+        // x row base and the tile index offset (LDS slice is indexed from the segment start)
+        const half* x = c.xl ? (c.xl + (size_t) m * seg_k) : (c.A + (size_t) m * c.size_k);
+        const int x_t0 = c.xl ? c.kt0 : 0;
         float acc0 = 0.f, acc1 = 0.f, xsum = 0.f;
 
         // Software pipeline (depth 1): tile t + 1 is requested before tile t is decoded
@@ -373,7 +388,7 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
                 #pragma unroll
                 for (int k = 0; k < NW; ++k) a[k + 1] = p32[bw + k];
             }
-            const uint4* xp = (const uint4*) (x + t * 16);
+            const uint4* xp = (const uint4*) (x + (t - x_t0) * 16);
             uint4 x0 = xp[0], x1 = xp[1];
             xw[0] = x0.x; xw[1] = x0.y; xw[2] = x0.z; xw[3] = x0.w;
             xw[4] = x1.x; xw[5] = x1.y; xw[6] = x1.z; xw[7] = x1.w;
@@ -593,7 +608,8 @@ __device__ void exl3_gemm_kernel_inner
     int* __restrict__ locks,
     const half* post_scale,
     int size_n_stride = 0,       // full width of B and C rows when computing a column slice (0: = size_n)
-    float* __restrict__ sh = nullptr
+    float* __restrict__ sh = nullptr,
+    const half* pre_scale = nullptr   // fused input Hadamard: A is the RAW input, rotated per segment with this scale
 )
 {
     using namespace exl3_rocm_inner;
@@ -630,9 +646,55 @@ __device__ void exl3_gemm_kernel_inner
         c.col = col;
         int cols = c.subs_tile * 16;
 
+#if EXL3_ROCM_FUSED_HAD
+        // Rotate this segment's x slice (size_m rows x (seg_k1 - seg_k0) tiles) into LDS: the
+        // 128-wide Hadamard blocks are 8 tiles, and segment bounds are tile-aligned, so the slice
+        // is widened to 128-aligned bounds. pre_scale = suh. One warp per 128-block
+        if (pre_scale)
+        {
+            const int kb0 = (seg_k0 * 16) / 128, kb1 = (seg_k1 * 16 + 127) / 128;
+            const int nblk = kb1 - kb0;
+            half* xl = (half*) (sh_c + 16 * TS_N);
+            const int seg_k = (seg_k1 - seg_k0) * 16;
+            // host-side grid bound guarantees this; a violation would silently corrupt sh_c
+            if (size_m * seg_k > EXL3_X_LDS_TILES * 16) __builtin_trap();
+            const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarps = blockDim.x >> 5;
+            __syncthreads();   // previous segment's readers of xl / sh_c are done
+            // whole-wave iteration count so the shuffle-based Hadamard never runs with a partial wave
+            for (int slot = warp; slot < size_m * nblk; slot += nwarps)
+            {
+                const int m = slot / nblk, b = kb0 + slot % nblk;
+                const half4 v = ((const half4*) (A + (size_t) m * size_k + b * 128))[lane];
+                const half4 sc = ((const half4*) (pre_scale + b * 128))[lane];
+                half2 vx = __hmul2(v.x, sc.x), vy = __hmul2(v.y, sc.y);
+                float v0 = __half2float(__low2half(vx)), v1 = __half2float(__high2half(vx));
+                float v2 = __half2float(__low2half(vy)), v3 = __half2float(__high2half(vy));
+                float s0 = v0 + v1, d0 = v0 - v1, s1 = v2 + v3, d1 = v2 - v3;
+                float h0 = s0 + s1, h1 = d0 + d1, h2 = s0 - s1, h3 = d0 - d1;
+                shuffle_had_f4x32(h0, h1, h2, h3, lane);
+                const float rs = 0.088388347648f;
+                // element index within the segment slice; the 128-block may overhang the segment
+                const int kk = b * 128 + lane * 4 - seg_k0 * 16;
+                if (kk >= 0 && kk < seg_k)
+                {
+                    half* dst = xl + (size_t) m * seg_k + kk;
+                    dst[0] = __float2half(h0 * rs); dst[1] = __float2half(h1 * rs);
+                    dst[2] = __float2half(h2 * rs); dst[3] = __float2half(h3 * rs);
+                }
+            }
+            __syncthreads();
+            c.xl = xl;
+        }
+        else c.xl = nullptr;
+#else
+        c.xl = nullptr;
+#endif
+
         // Lane-local tiers re-decode the weights once per m row, the warp tier once per
         // subtile: the former wins for decode-shaped m, the latter for prefill chunks
         constexpr int LANE_TIER_MAX_M = 8;
+        // (the host only enables the fused Hadamard for size_m <= LANE_TIER_MAX_M, whose tier
+        // reads c.xl; the other tiers read the pre-rotated A)
         if constexpr (cb == 2 && bits == 4 && !half_k && !EXL3_ROCM_LANE_TIER_ALL)
         {
             phase1_b4c2(c);

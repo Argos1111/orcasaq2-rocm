@@ -74,6 +74,27 @@ void exl3_gemm_had_kernel
 }
 #endif
 
+#if defined(USE_ROCM)
+// Fused input Hadamard: every block rotates its k segment (widened to 128-aligned bounds) into an
+// LDS slice of EXL3_X_LDS_TILES tiles. A segment never spans two column tiles, so its length is
+// min(tiles_k, ceil(units / grid)); this returns the smallest grid for which the padded slice
+// fits, or -1 when even a full-k segment does not fit (then the separate Hadamard kernel runs)
+static inline int exl3_rocm_fused_had_min_grid(int size_m, int size_k, int size_n, int tilesize_n)
+{
+#if !EXL3_ROCM_FUSED_HAD
+    return -1;
+#endif
+    if (size_m > 8) return -1;                           // only the lane tier reads the LDS slice
+    const int tiles_k = size_k / 16;
+    const int units = tiles_k * (size_n / tilesize_n);
+    const int budget_tiles = EXL3_X_LDS_TILES / size_m;
+    const int max_seg = budget_tiles - 16;               // 128-alignment can add up to 7 tiles each side
+    if (max_seg < 1) return -1;
+    if (tiles_k <= max_seg) return 1;
+    return CEIL_DIVIDE(units, max_seg);
+}
+#endif
+
 uint64_t gemm_autotune_hash
 (
     int size_m,
@@ -224,6 +245,50 @@ int exl3_gemm_gr
     // Graph parameter recording: the had kernel exposes GP_gemm_A (arg 0) and GP_gemm_B_suh
     // (arg 2) and the body kernel the remaining ones; the site list below follows kernel order
     TORCH_CHECK(A_had_ptr && suh_ptr, "exl3_gemm (ROCm): suh and A_had are required");
+    // Fused input Hadamard inside the body kernel (per-segment LDS rotation) when the segment's x
+    // slice fits the LDS budget; otherwise the separate Hadamard kernel + body reading A_had.
+    // The autotuned grid decides the segment length, so the bound is checked against the
+    // smallest grid the autotuner may pick (see exl3_gemm_shape_compat / grid_cap below)
+    // fused iff every compatible tile shape admits a grid within the device's block capacity
+    bool fused_had = true;
+    int fused_min_grid[EXL3_GEMM_NUM_SHAPES + 1] = {};
+    for (int si = 1; si <= EXL3_GEMM_NUM_SHAPES; ++si)
+    {
+        if (!exl3_gemm_shape_compat(si, size_m, size_k, size_n, K)) continue;
+        int g = exl3_rocm_fused_had_min_grid(size_m, size_k, size_n, exl3_gemm_tilesize_n_g[si]);
+        fused_min_grid[si] = g;
+    }
+    // fused iff at least one compatible shape can satisfy its bound within its occupancy limit
+    {
+        bool any = false;
+        for (int si = 1; si <= EXL3_GEMM_NUM_SHAPES; ++si)
+        {
+            if (!exl3_gemm_shape_compat(si, size_m, size_k, size_n, K) || fused_min_grid[si] < 0) continue;
+            fp_exl3_gemm_kernel kf = get_gemm_kernel_ptr(K, si, c_fp32, cb, half_k);
+            if (!kf) continue;
+            int bps = 1;
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, (const void*) kf, exl3_gemm_blockdim_g[si], SMEM_MAX);
+            cudaGetLastError();
+            int tilesize_k = exl3_gemm_tilesize_k_g[si];
+            int max_slices = MAX(size_k / tilesize_k * size_n / exl3_gemm_tilesize_n_g[si], 1);
+            int cap = MIN(max_slices, num_sms * MAX(MIN(bps, 12), 1));
+            if (fused_min_grid[si] <= cap) any = true;
+        }
+        fused_had = any;
+    }
+    if (force_shape_idx > 0 || force_num_sms > 0)
+    {
+        // benchmark overrides bypass the autotuner bound: fused only when the forced grid fits
+        static const bool dbg_force_fused = getenv("EXL3_ROCM_FORCE_FUSED_HAD") != nullptr;
+        fused_had = fused_had && dbg_force_fused && force_shape_idx > 0 && force_num_sms >= fused_min_grid[force_shape_idx];
+    }
+    const half* body_suh = nullptr;
+    const half* A_body_ptr = A_ptr;
+    if (fused_had)
+    {
+        body_suh = suh_ptr;
+    }
+    else
     {
         int total_warps = size_m * size_k / 128;
         int had_blocks = CEIL_DIVIDE(total_warps, 8);
@@ -234,8 +299,8 @@ int exl3_gemm_gr
             graph->record_param((void*) exl3_gemm_had_kernel, GP_gemm_A_had, 1);
             graph->record_param((void*) exl3_gemm_had_kernel, GP_gemm_B_suh, 2);
         }
+        A_body_ptr = A_had_ptr;
     }
-    const half* A_body_ptr = A_had_ptr;
     void* kernelArgs[] =
     {
         (void*)& A_body_ptr,
@@ -245,7 +310,7 @@ int exl3_gemm_gr
         (void*)& size_k,
         (void*)& size_n,
         (void*)& locks,
-        (void*)& suh_ptr,
+        (void*)& body_suh,
         (void*)& A_had_ptr,
         (void*)& svh_ptr
     };
@@ -270,7 +335,7 @@ int exl3_gemm_gr
         if (graph)
         {
 #if defined(USE_ROCM)
-            graph->record_param(kernel_ptr, GP_gemm_A_had, 0);
+            graph->record_param(kernel_ptr, fused_had ? GP_gemm_A : GP_gemm_A_had, 0);
 #else
             graph->record_param(kernel_ptr, GP_gemm_A, 0);
 #endif
@@ -305,6 +370,9 @@ int exl3_gemm_gr
     if (autotune)
     {
         uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
+#if defined(USE_ROCM)
+        if (fused_had) autotune_key ^= 0xF05EDA0Dull;
+#endif
         CoopAutotuneLaunch tuned;
         if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, SMEM_MAX, stream, &tuned))
         {
@@ -341,15 +409,25 @@ int exl3_gemm_gr
 #endif
             int max_candidate_sms = MAX(MIN(max_slices, grid_cap), 1);
 
-            candidates.push_back
-            ({
+            CoopAutotuneCandidate cand
+            {
                 (void*) candidate_kernel,
                 exl3_gemm_blockdim_g[candidate_shape_idx],
                 max_candidate_sms,
                 1,
                 max_candidate_sms,
                 candidate_shape_idx
-            });
+            };
+#if defined(USE_ROCM)
+            if (fused_had)
+            {
+                // a shape whose smallest LDS-safe grid exceeds its occupancy-limited maximum is
+                // not a candidate at all (the segment slice would overflow the LDS)
+                if (fused_min_grid[candidate_shape_idx] > max_candidate_sms) continue;
+                cand.min_num_sms = fused_min_grid[candidate_shape_idx];
+            }
+#endif
+            candidates.push_back(cand);
         }
         TORCH_CHECK(!candidates.empty(), "exl3_gemm autotune: no compatible kernel shapes");
 

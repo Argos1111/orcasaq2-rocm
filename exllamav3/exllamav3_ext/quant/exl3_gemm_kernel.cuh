@@ -28,9 +28,9 @@ __global__ void exl3_gemm_had_kernel
     const int total_warps
 );  // defined in exl3_gemm.cu
 
-// GEMM body: A is already the Hadamard-transformed input (A_had of the caller). suh / A_had
-// parameters are kept so the argument list (and the graph parameter indices) match the
-// cooperative kernel's
+// GEMM body. With EXL3_ROCM_FUSED_HAD, A is the RAW input and each block rotates its own k slice
+// (scaled by suh) into LDS; otherwise A is the caller's A_had and suh is passed as nullptr. The
+// argument list (and so the graph parameter indices) matches the cooperative kernel's
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
 void exl3_gemm_body_kernel(EXL3_GEMM_ARGS)
@@ -47,7 +47,7 @@ void exl3_gemm_body_kernel(EXL3_GEMM_ARGS)
     {
         exl3_gemm_kernel_inner
         <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true>
-        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks_, svh, 0, inner_sh);
+        (A_, B, C_, MIN(size_m_, 16), size_k, size_n, locks_, svh, 0, inner_sh, suh);
         A_ += 16 * size_k;
         if constexpr (c_fp32) C_ = (void*) (((float*) C_) + 16 * size_n);
         else                  C_ = (void*) (((half*) C_) + 16 * size_n);

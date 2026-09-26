@@ -12,6 +12,7 @@ struct CoopAutotuneCandidate
     int max_concurrency;
     int total_sms;
     int tag;
+    int min_num_sms = 0;    // lower bound on the grid (0: autotuner default). Cached records below it are rejected
 };
 
 struct CoopAutotuneLaunch
