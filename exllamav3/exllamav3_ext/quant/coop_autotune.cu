@@ -548,11 +548,24 @@ CoopAutotuneLaunch tune
             candidates.push_back({ base.kernel, base.block_dim, 1, concurrency, base.tag, 0.0f, {} });
         }
 
+#if defined(USE_ROCM)
+        // plain launches with grids of several blocks per CU: sample multiples of the CU count
+        // (plus the wide range below it) rather than every even value up to max
+        {
+            int step = MAX(2, base.max_num_sms / 48);
+            for (int num_sms = min_num_sms; num_sms <= base.max_num_sms * 85 / 100; num_sms += step)
+            {
+                int concurrency = MAX(MIN(total_sms / num_sms, max_concurrency), 1);
+                candidates.push_back({ base.kernel, base.block_dim, num_sms, concurrency, base.tag, 0.0f, {} });
+            }
+        }
+#else
         for (int num_sms = min_num_sms; num_sms <= base.max_num_sms * 85 / 100; num_sms += 2)
         {
             int concurrency = MAX(MIN(total_sms / num_sms, max_concurrency), 1);
             candidates.push_back({ base.kernel, base.block_dim, num_sms, concurrency, base.tag, 0.0f, {} });
         }
+#endif
 
         if (base.max_num_sms > 1)
         {

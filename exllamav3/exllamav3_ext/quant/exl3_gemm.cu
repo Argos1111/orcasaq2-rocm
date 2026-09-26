@@ -336,7 +336,7 @@ int exl3_gemm_gr
                     exl3_gemm_blockdim_g[candidate_shape_idx], SMEM_MAX
                 );
                 cudaGetLastError();
-                grid_cap = num_sms * MAX(MIN(blocks_per_sm, 4), 1);
+                grid_cap = num_sms * MAX(MIN(blocks_per_sm, 12), 1);
             }
 #endif
             int max_candidate_sms = MAX(MIN(max_slices, grid_cap), 1);
