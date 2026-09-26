@@ -32,13 +32,23 @@
 #ifndef EXL3_ROCM_FUSED_HAD
 #define EXL3_ROCM_FUSED_HAD 1
 #endif
-#define EXL3_X_LDS_TILES 256                                 // 4096 k
+#define EXL3_X_LDS_TILES 128                                 // 2048 k
 #define EXL3_X_LDS_FLOATS (EXL3_X_LDS_TILES * 16 / 2)        // fp16 halves stored as floats/2
 #define EXL3_INNER_SH_FLOATS(ts_n) (16 * (ts_n) + (EXL3_ROCM_FUSED_HAD ? EXL3_X_LDS_FLOATS : 0))
 
 // 1: route the 4/6-bit mul1 tensors through the generic k-split lane tier as well
 #ifndef EXL3_ROCM_LANE_TIER_ALL
 #define EXL3_ROCM_LANE_TIER_ALL 1
+#endif
+
+#ifdef EXL3_ROCM_PROBE
+// gfx11: s_sendmsg_rtn_b64 REALTIME (100 MHz constant clock, consistent across CUs)
+__device__ __forceinline__ unsigned long long __probe_now()
+{
+    unsigned long long t;
+    asm volatile("s_sendmsg_rtn_b64 %0, sendmsg(MSG_RTN_GET_REALTIME)\n\ts_waitcnt lgkmcnt(0)" : "=s"(t));
+    return t;
+}
 #endif
 
 namespace exl3_rocm_inner
@@ -74,6 +84,12 @@ __device__ __forceinline__ float decode_w_mul1(uint32_t code)
 // quarter-rate v_dot4. With the accumulator 0x6400 the result's low half is the fp16 value
 // 1024 + bytesum exactly, which feeds v_fma_mix_f32 directly; the affine correction
 // (k_inv, k_bias * sum(x)) is applied once per output instead of once per weight
+#ifndef EXL3_ROCM_SLICE_PERMUTE
+#define EXL3_ROCM_SLICE_PERMUTE 1
+#endif
+#ifndef EXL3_ROCM_PAIRED_DOT2
+#define EXL3_ROCM_PAIRED_DOT2 1    // sad_hi_u8 + dot2_f32_f16 epilogue (see phase1_lane)
+#endif
 #ifndef EXL3_ROCM_ILV
 #define EXL3_ROCM_ILV 8     // codes decoded in lock-step per stage (see phase1_lane)
 #endif
@@ -429,6 +445,29 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
                     for (int j = 0; j < EXL3_ROCM_ILV; ++j) asm volatile("v_mad_u32_u16 %0, %1, %2, 0" : "=v"(t[j]) : "v"(code[j]), "s"(0xD12Du));
                     #pragma unroll
                     for (int j = 0; j < EXL3_ROCM_ILV; ++j) asm volatile("v_mad_u16 %0, %1, %2, %0 op_sel:[0,0,1,1]" : "+v"(t[j]) : "v"(code[j]), "s"(0x83DCu));
+#if EXL3_ROCM_PAIRED_DOT2
+                    // Paired epilogue: within a group of 8 codes, codes k and k+1 (k even) hit the
+                    // adjacent activation rows 2g + 8*((k>>1)&1) + {0,1} = one packed x word, and
+                    // they both go to the same output column (k < 4: col 0, else col 1). sad_u8 with
+                    // 0x64006400 leaves fp16(1024+bs) in the low half and 0x6400 in the high half;
+                    // sad_hi_u8 of the odd code then adds its byte sum into that high half -> one
+                    // register holding the fp16 pair, consumed by a single v_dot2_f32_f16.
+                    // 4.5 VALU ops per weight instead of 5
+                    uint32_t pk[EXL3_ROCM_ILV / 2];
+                    #pragma unroll
+                    for (int j = 0; j < EXL3_ROCM_ILV; j += 2) asm volatile("v_sad_u8 %0, %0, 0, 0x64006400" : "+v"(t[j]));
+                    #pragma unroll
+                    for (int j = 0; j < EXL3_ROCM_ILV; j += 2) asm volatile("v_sad_hi_u8 %0, %1, 0, %2" : "=v"(pk[j / 2]) : "v"(t[j + 1]), "v"(t[j]));
+                    #pragma unroll
+                    for (int j = 0; j < EXL3_ROCM_ILV; j += 2)
+                    {
+                        const int i = i0 + j;
+                        const int g = i >> 3, k = i & 7;
+                        const int r = 2 * g + 8 * ((k >> 1) & 1);          // even row of the pair
+                        float* acc = (k < 4) ? ((k & 2) ? &b0 : &acc0) : ((k & 2) ? &b1 : &acc1);
+                        asm volatile("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(*acc) : "v"(pk[j / 2]), "v"(xw[r / 2]));
+                    }
+#else
                     #pragma unroll
                     for (int j = 0; j < EXL3_ROCM_ILV; ++j) asm volatile("v_sad_u8 %0, %0, 0, 0x6400" : "+v"(t[j]));
                     #pragma unroll
@@ -441,6 +480,7 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
                         if (k < 4) { if (k & 1) b0 += pr; else acc0 += pr; }
                         else       { if (k & 1) b1 += pr; else acc1 += pr; }
                     }
+#endif
                 }
                 acc0 += b0; acc1 += b1;
                 float sx = 0.f;
@@ -623,8 +663,20 @@ __device__ void exl3_gemm_kernel_inner
     int tiles_n = size_n / TS_N;
     int units = tiles_k * tiles_n;
     int num_slices = gridDim.x;
-    int beg = (int) ((int64_t) units * blockIdx.x / num_slices);
-    int end = (int) ((int64_t) units * (blockIdx.x + 1) / num_slices);
+#if EXL3_ROCM_SLICE_PERMUTE
+    // Blocks are dispatched in index order and adjacent indices take adjacent (column, k) slices
+    // -> at any moment the resident blocks stream neighbouring rows of B and their DRAM traffic
+    // piles onto the same channels (measured: identical work per block, duration growing
+    // linearly with blockIdx). Stride the slice assignment so co-resident blocks are spread over
+    // the whole tile space
+    const int stride = 48;   // ~ CU count; coprime with grid sizes that are not multiples of 48 handled below
+    int sid = blockIdx.x;
+    if (num_slices % stride == 0) sid = (blockIdx.x % stride) * (num_slices / stride) + blockIdx.x / stride;
+#else
+    const int sid = blockIdx.x;
+#endif
+    int beg = (int) ((int64_t) units * sid / num_slices);
+    int end = (int) ((int64_t) units * (sid + 1) / num_slices);
 
     SegCtx c;
     c.A = A;
@@ -635,6 +687,13 @@ __device__ void exl3_gemm_kernel_inner
     c.nsub_total = n_full / 16;
     c.subs_tile = TS_N / 16;
 
+#ifdef EXL3_ROCM_PROBE
+    // debug: per-block phase timestamps -> locks + 65536 + blockIdx.x * 8 (uint64 x 4)
+    unsigned long long* probe = (unsigned long long*) (locks + 65536) + blockIdx.x * 4;
+    unsigned long long tp0 = __probe_now();
+    unsigned long long tp_start = tp0;
+    unsigned long long tp_phase1 = 0, tp_lock = 0, tp_out = 0;
+#endif
     while (beg < end)
     {
         int col = beg / tiles_k;
@@ -713,11 +772,17 @@ __device__ void exl3_gemm_kernel_inner
         // bits == 0 never reaches the inner (the caller switches on K first)
 
         __syncthreads();
+#ifdef EXL3_ROCM_PROBE
+        unsigned long long tpa = __probe_now();
+#endif
 
         int lock_i = tiles_k - seg_k1;
         int lock_d = seg_k1 - seg_k0;
         int* lock = &locks[col];
         lock_acquire(lock, lock_i);
+#ifdef EXL3_ROCM_PROBE
+        unsigned long long tpb = __probe_now();
+#endif
 
         bool first = (lock_i == 0);
         bool last = (lock_i + lock_d == tiles_k);
@@ -815,8 +880,15 @@ __device__ void exl3_gemm_kernel_inner
         }
 
         lock_release(lock, lock_d, last);
+#ifdef EXL3_ROCM_PROBE
+        unsigned long long tpc = __probe_now();
+        tp_phase1 += tpa - tp0; tp_lock += tpb - tpa; tp_out += tpc - tpb; tp0 = tpc;
+#endif
 
         // phase 1 must store fresh values: the accumulate path adds into sh_c
         beg = (col + 1) * tiles_k;
     }
+#ifdef EXL3_ROCM_PROBE
+    if (threadIdx.x == 0) { probe[0] = tp_phase1; probe[1] = tp_lock; probe[2] = tp_start; probe[3] = __probe_now(); }
+#endif
 }

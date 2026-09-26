@@ -95,6 +95,14 @@ static inline int exl3_rocm_fused_had_min_grid(int size_m, int size_k, int size_
 }
 #endif
 
+// The ROCm body kernel stages everything in static LDS (inner_sh); requesting SMEM_MAX of dynamic
+// LDS on top only lowers occupancy
+#if defined(USE_ROCM)
+#define GEMM_DYN_SMEM 0
+#else
+#define GEMM_DYN_SMEM SMEM_MAX
+#endif
+
 uint64_t gemm_autotune_hash
 (
     int size_m,
@@ -267,7 +275,7 @@ int exl3_gemm_gr
             fp_exl3_gemm_kernel kf = get_gemm_kernel_ptr(K, si, c_fp32, cb, half_k);
             if (!kf) continue;
             int bps = 1;
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, (const void*) kf, exl3_gemm_blockdim_g[si], SMEM_MAX);
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, (const void*) kf, exl3_gemm_blockdim_g[si], GEMM_DYN_SMEM);
             cudaGetLastError();
             int tilesize_k = exl3_gemm_tilesize_k_g[si];
             int max_slices = MAX(size_k / tilesize_k * size_n / exl3_gemm_tilesize_n_g[si], 1);
@@ -374,7 +382,7 @@ int exl3_gemm_gr
         if (fused_had) autotune_key ^= 0xF05EDA0Dull;
 #endif
         CoopAutotuneLaunch tuned;
-        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, SMEM_MAX, stream, &tuned))
+        if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, GEMM_DYN_SMEM, stream, &tuned))
         {
             add_graph_args((void*) tuned.kernel);
             cuda_check(cudaPeekAtLastError());
@@ -401,7 +409,7 @@ int exl3_gemm_gr
                 cudaOccupancyMaxActiveBlocksPerMultiprocessor
                 (
                     &blocks_per_sm, (const void*) candidate_kernel,
-                    exl3_gemm_blockdim_g[candidate_shape_idx], SMEM_MAX
+                    exl3_gemm_blockdim_g[candidate_shape_idx], GEMM_DYN_SMEM
                 );
                 cudaGetLastError();
                 grid_cap = num_sms * MAX(MIN(blocks_per_sm, 12), 1);
@@ -431,7 +439,7 @@ int exl3_gemm_gr
         }
         TORCH_CHECK(!candidates.empty(), "exl3_gemm autotune: no compatible kernel shapes");
 
-        tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, SMEM_MAX, stream, (size_t) size_k * size_n);
+        tuned = CoopKernelAutotuner::launch(autotune_key, candidates, kernelArgs, GEMM_DYN_SMEM, stream, (size_t) size_k * size_n);
         if (graph)
         add_graph_args((void*) tuned.kernel);
         cuda_check(cudaPeekAtLastError());
@@ -449,7 +457,7 @@ int exl3_gemm_gr
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())
     {
-        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_MAX);
+        cudaFuncSetAttribute((const void*) kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, GEMM_DYN_SMEM);
         kernel_attr_set[device].insert((void*) kernel);
         cuda_check(cudaPeekAtLastError());
     }
@@ -458,13 +466,13 @@ int exl3_gemm_gr
         // forced grid (benchmarks): reject an over-subscribed cooperative launch with a Python
         // exception instead of the fatal cuda_check exit
         int blocks_per_sm = 1;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, (const void*) kernel, block_dim, SMEM_MAX);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, (const void*) kernel, block_dim, GEMM_DYN_SMEM);
         cudaGetLastError();
         int max_blocks = blocks_per_sm * DevCtx::instance().get_num_sms(device);
         TORCH_CHECK(num_sms <= max_blocks, "exl3_gemm: forced grid ", num_sms, " exceeds cooperative limit ", max_blocks, " for shape ", shape_idx);
     }
 #if defined(USE_ROCM)
-    cudaLaunchKernel((void*) kernel, dim3(num_sms), dim3(block_dim), kernelArgs, SMEM_MAX, stream);
+    cudaLaunchKernel((void*) kernel, dim3(num_sms), dim3(block_dim), kernelArgs, GEMM_DYN_SMEM, stream);
 #else
     cudaLaunchCooperativeKernel
     (
@@ -472,7 +480,7 @@ int exl3_gemm_gr
         num_sms,
         block_dim,
         kernelArgs,
-        SMEM_MAX,
+        GEMM_DYN_SMEM,
         stream
     );
 #endif
@@ -481,6 +489,19 @@ int exl3_gemm_gr
     cuda_check(cudaPeekAtLastError());
     return shape_idx;
 }
+
+#if defined(USE_ROCM)
+// debug: copy the per-block probe area (see EXL3_ROCM_PROBE in the inner) into a tensor
+void exl3_rocm_probe_read(at::Tensor out)
+{
+    int device; cudaGetDevice(&device);
+    int* locks = DevCtx::instance().get_locks(device);
+    cudaDeviceSynchronize();
+    cudaMemcpy(out.data_ptr(), locks + 65536, out.numel() * out.element_size(), cudaMemcpyDeviceToDevice);
+    cudaMemset(locks + 65536, 0, out.numel() * out.element_size());
+    cudaDeviceSynchronize();
+}
+#endif
 
 int exl3_gemm
 (

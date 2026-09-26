@@ -84,3 +84,7 @@ int exl3_mgemm
     const c10::optional<at::Tensor>& had_src_list = {},
     int num_had_src = 0
 );
+
+#if defined(USE_ROCM)
+void exl3_rocm_probe_read(at::Tensor out);
+#endif
