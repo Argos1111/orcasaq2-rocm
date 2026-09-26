@@ -552,12 +552,16 @@ CoopAutotuneLaunch tune
         }
 
 #if defined(USE_ROCM)
-        // plain launches with grids of several blocks per CU: sample multiples of the CU count
-        // (plus the wide range below it) rather than every even value up to max
+        // plain launches with grids of several blocks per CU. Exhaustive sweeps (bench_sweep_all.py)
+        // show the winners are always whole multiples of the CU count (every CU gets the same
+        // number of blocks; a partial last wave of blocks only lengthens the tail), so sample
+        // those, plus half-multiples below one block per CU for the small shapes
         {
-            int step = MAX(2, base.max_num_sms / 48);
-            for (int num_sms = min_num_sms; num_sms <= base.max_num_sms * 85 / 100; num_sms += step)
+            const int cus = base.total_sms > 0 ? base.total_sms : 48;
+            for (int num_sms = cus / 2; num_sms <= base.max_num_sms; num_sms += cus / 2)
             {
+                if (num_sms < min_num_sms) continue;
+                if (num_sms > cus && (num_sms % cus) != 0) continue;
                 int concurrency = MAX(MIN(total_sms / num_sms, max_concurrency), 1);
                 candidates.push_back({ base.kernel, base.block_dim, num_sms, concurrency, base.tag, 0.0f, {} });
             }
@@ -570,7 +574,11 @@ CoopAutotuneLaunch tune
         }
 #endif
 
+#if defined(USE_ROCM)
+        if (base.max_num_sms > 1 && (base.max_num_sms % MAX(base.total_sms, 1)) != 0)
+#else
         if (base.max_num_sms > 1)
+#endif
         {
             int concurrency = MAX(MIN(total_sms / base.max_num_sms, max_concurrency), 1);
             candidates.push_back({ base.kernel, base.block_dim, base.max_num_sms, concurrency, base.tag, 0.0f, {} });

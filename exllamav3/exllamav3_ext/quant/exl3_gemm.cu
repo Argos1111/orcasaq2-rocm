@@ -446,7 +446,11 @@ int exl3_gemm_gr
                 exl3_gemm_blockdim_g[candidate_shape_idx],
                 max_candidate_sms,
                 1,
+#if defined(USE_ROCM)
+                num_sms,             // total_sms = CU count: the autotuner samples multiples of it
+#else
                 max_candidate_sms,
+#endif
                 candidate_shape_idx
             };
 #if defined(USE_ROCM)
