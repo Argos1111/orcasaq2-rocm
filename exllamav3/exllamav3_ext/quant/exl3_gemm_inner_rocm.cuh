@@ -64,21 +64,22 @@ __device__ __forceinline__ float decode_w_mul1(uint32_t code)
 // quarter-rate v_dot4. With the accumulator 0x6400 the result's low half is the fp16 value
 // 1024 + bytesum exactly, which feeds v_fma_mix_f32 directly; the affine correction
 // (k_inv, k_bias * sum(x)) is applied once per output instead of once per weight
+#ifndef EXL3_ROCM_PIPELINE
+#define EXL3_ROCM_PIPELINE 1
+#endif
 #ifndef EXL3_ROCM_FAST_MUL1
 #define EXL3_ROCM_FAST_MUL1 1
 #endif
 __device__ __forceinline__ uint32_t mul1_h1024(uint32_t code)
 {
 #if EXL3_ROCM_FAST_MUL1
-    // Two full-rate 16-bit multiplies (the compiler would otherwise fold the high product back
-    // into a quarter-rate v_mul_lo_u32), reading only the low 16 bits of `code` so the funnel
-    // shift's garbage above bit 15 never needs masking:
-    //   t  = lo16(code) * 0xD12D                    (v_mad_u32_u16, full 32-bit result)
-    //   t += (lo16(code) * 0x83DC) << 16            (v_mad_u16 into the high half via op_sel)
-    //   == code * 0x83DCD12D mod 2^32
-    uint32_t t;
-    asm("v_mad_u32_u16 %0, %1, %2, 0" : "=v"(t) : "v"(code), "s"(0xD12Du));
-    asm("v_mad_u16 %0, %1, %2, %0 op_sel:[0,0,1,1]" : "+v"(t) : "v"(code), "s"(0x83DCu));
+    // Two full-rate 16-bit multiplies via intrinsics (no inline asm: hand-written asm with tied
+    // operands mis-scheduled in the interleaved loop of the half-integer instances):
+    //   lo24(code) * 0xD12D  (v_mul_u32_u24)  +  (lo16(code) * 0x83DC) << 16  (v_mul_lo_u16 + shift-add)
+    const uint32_t c16 = code & 0xFFFFu;
+    const uint32_t lo = __umul24(c16, 0xD12Du);
+    const uint32_t hi = (uint32_t) (uint16_t) ((uint16_t) c16 * (uint16_t) 0x83DCu);
+    const uint32_t t = lo + (hi << 16);
     return __builtin_amdgcn_sad_u8(t, 0u, 0x6400u);
 #else
     const uint32_t p = (code & 0xFFFFu) * 0x83DCD12Du;
@@ -98,13 +99,9 @@ __device__ __forceinline__ void lock_acquire(int* lock, int stage)
     {
         unsigned int* a = (unsigned int*) lock;
         unsigned int state;
-        unsigned int spins = 0;
         do
         {
             state = __hip_atomic_load(a, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
-            // A cooperative launch whose blocks are not all resident deadlocks here; surface it as
-            // a kernel fault instead of a silent hang
-            if (++spins == (1u << 28)) __builtin_trap();
         }
         while (state != (unsigned int) stage);
     }
@@ -434,15 +431,23 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
         };
 
 
-        int t = t0;
-        if (t < t1) load_tile(t, bufA, xA);
-        for (; t + 1 < t1; t += 2)
+#if EXL3_ROCM_PIPELINE
+        // even/odd tile split with a fixed trip count: the compiler turned the earlier
+        // `for (; t + 1 < t1; t += 2)` form with in-loop conditional loads into a non-terminating
+        // loop for the half-integer instances
+        const int ntiles = t1 - t0;
+        if (ntiles > 0) load_tile(t0, bufA, xA);
+        for (int i = 0; i < ntiles; i += 2)
         {
-            load_tile(t + 1, bufB, xB);  decode_tile(bufA, xA);
-            if (t + 2 < t1) load_tile(t + 2, bufA, xA);
-            decode_tile(bufB, xB);
+            const bool has_b = (i + 1 < ntiles);
+            if (has_b) load_tile(t0 + i + 1, bufB, xB);
+            decode_tile(bufA, xA);
+            if (i + 2 < ntiles) load_tile(t0 + i + 2, bufA, xA);
+            if (has_b) decode_tile(bufB, xB);
         }
-        if (t < t1) decode_tile(bufA, xA);
+#else
+        for (int t = t0; t < t1; ++t) { load_tile(t, bufA, xA); decode_tile(bufA, xA); }
+#endif
 
         if constexpr (cb == 2)
         {
