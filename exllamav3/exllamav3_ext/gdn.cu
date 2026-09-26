@@ -779,25 +779,27 @@ void cuda_recurrent_gated_delta_rule_kernel_128
 
         __syncthreads();
 
+        // Each thread owns a column slice of the state (BTS = HEAD_DIM / SUBK rows of one v column).
+        // Pass 1 reads it for dot1 = k . S[:, v]; pass 2 rewrites it with the update and reads it
+        // again for the q dot. The slice is held in registers between the passes so the state
+        // (fp32, 48 heads x 64 KB per layer) is streamed from memory once instead of twice
+        float st[BTS];
         if (t < V_CHUNK_DIM)
         {
             float sum = 0.0f;
             float* sh_k_rd = sh_k + bt * BTS;
             float* sh_g_rd = sh_g + bt * BTS;
-            float* rs_rd = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
+            const float* rs_rd = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
 
             #pragma unroll
-            for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
+            for (int i = 0; i < BTS; ++i, rs_rd += HEAD_DIM)
             {
-                #pragma unroll
-                for (int j = 0; j < 8; ++j, rs_rd += HEAD_DIM, sh_k_rd++, sh_g_rd++)
-                {
-                    if constexpr (CHANNELWISE)
-                        // Decay folded per k-channel: kv_mem reads the decayed state
-                        sum = sum + *sh_k_rd * *sh_g_rd * *rs_rd;
-                    else
-                        sum = sum + *sh_k_rd * *rs_rd;
-                }
+                st[i] = *rs_rd;
+                if constexpr (CHANNELWISE)
+                    // Decay folded per k-channel: kv_mem reads the decayed state
+                    sum = sum + sh_k_rd[i] * sh_g_rd[i] * st[i];
+                else
+                    sum = sum + sh_k_rd[i] * st[i];
             }
             sh_dot1[bt][t] = sum;
         }
@@ -816,20 +818,15 @@ void cuda_recurrent_gated_delta_rule_kernel_128
             float* sh_k_rd = sh_k + bt * BTS;
             float* sh_g_rd = sh_g + bt * BTS;
             float* sh_q_rd = sh_q + bt * BTS;
-            float* rs_r = gl_rs_r + v_start + t + bt * BTS * HEAD_DIM;
             float* rs_w = gl_rs_w + v_start + t + bt * BTS * HEAD_DIM;
 
             #pragma unroll
-            for (int i = 0; i < HEAD_DIM / 8 / SUBK; ++i)
+            for (int i = 0; i < BTS; ++i, rs_w += HEAD_DIM)
             {
-                #pragma unroll
-                for (int j = 0; j < 8; ++j, rs_r += HEAD_DIM, rs_w += HEAD_DIM, sh_k_rd++, sh_g_rd++, sh_q_rd++)
-                {
-                    float state = *rs_r;
-                    state = state * (CHANNELWISE ? *sh_g_rd : g_h) + *sh_k_rd * v * beta_h;
-                    *rs_w = state;
-                    v_out = v_out + *sh_q_rd * state;
-                }
+                float state = st[i];
+                state = state * (CHANNELWISE ? sh_g_rd[i] : g_h) + sh_k_rd[i] * v * beta_h;
+                *rs_w = state;
+                v_out = v_out + sh_q_rd[i] * state;
             }
             sh_dot2[bt][t] = v_out;
         }
@@ -1648,16 +1645,38 @@ void gdn_ba_gemv_kernel
     if (row >= n) return;
     int r = blockIdx.y;
 
-    const half2* x2 = (const half2*) (x + (size_t) r * k);
-    const half2* w2 = (const half2*) (w_t + (size_t) row * k);
-
     float sum = 0.0f;
-    for (int j = lane; j < k / 2; j += 32)
+    if ((k & 7) == 0)
     {
-        float2 xf = __half22float2(x2[j]);
-        float2 wf = __half22float2(w2[j]);
-        sum = fmaf(xf.x, wf.x, sum);
-        sum = fmaf(xf.y, wf.y, sum);
+        // 16-byte loads, 4 independent accumulators (the row is a 96-way... 48-row weight per
+        // layer (n = 96 with 5120 k): 8 KB per warp pass, so the loop is latency-bound on the
+        // per-lane load chain; wide loads + ILP cut the ROCm kernel from ~22 us to ~8 us)
+        const uint4* x4 = (const uint4*) (x + (size_t) r * k);
+        const uint4* w4 = (const uint4*) (w_t + (size_t) row * k);
+        float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+        const int n4 = k / 8;
+        for (int j = lane; j < n4; j += 32)
+        {
+            uint4 xv = x4[j], wv = w4[j];
+            float2 a, b;
+            a = __half22float2(*(half2*) &xv.x); b = __half22float2(*(half2*) &wv.x); s0 = fmaf(a.x, b.x, s0); s1 = fmaf(a.y, b.y, s1);
+            a = __half22float2(*(half2*) &xv.y); b = __half22float2(*(half2*) &wv.y); s2 = fmaf(a.x, b.x, s2); s3 = fmaf(a.y, b.y, s3);
+            a = __half22float2(*(half2*) &xv.z); b = __half22float2(*(half2*) &wv.z); s0 = fmaf(a.x, b.x, s0); s1 = fmaf(a.y, b.y, s1);
+            a = __half22float2(*(half2*) &xv.w); b = __half22float2(*(half2*) &wv.w); s2 = fmaf(a.x, b.x, s2); s3 = fmaf(a.y, b.y, s3);
+        }
+        sum = (s0 + s1) + (s2 + s3);
+    }
+    else
+    {
+        const half2* x2 = (const half2*) (x + (size_t) r * k);
+        const half2* w2 = (const half2*) (w_t + (size_t) row * k);
+        for (int j = lane; j < k / 2; j += 32)
+        {
+            float2 xf = __half22float2(x2[j]);
+            float2 wf = __half22float2(w2[j]);
+            sum = fmaf(xf.x, wf.x, sum);
+            sum = fmaf(xf.y, wf.y, sum);
+        }
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)
