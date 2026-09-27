@@ -214,25 +214,33 @@ fp_exl3_mgemm_kernel select_exl3_mgemm_kernel
 
 
 #if defined(USE_ROCM)
-#define EXL3_GEMM2_TABLE_ROW(K) { tfp_exl3_gemm2_kernel_fp16_b##K##_cb0, tfp_exl3_gemm2_kernel_fp16_b##K##_cb1, tfp_exl3_gemm2_kernel_fp16_b##K##_cb2 }
+#define EXL3_GEMM2_TABLE_ROW(fp, K) { tfp_exl3_gemm2_kernel_##fp##_b##K##_cb0, tfp_exl3_gemm2_kernel_##fp##_b##K##_cb1, tfp_exl3_gemm2_kernel_##fp##_b##K##_cb2 }
 static fp_exl3_gemm2_kernel* const tab_gemm2_fp16[9][3] =
 {
     { nullptr, nullptr, nullptr },
-    EXL3_GEMM2_TABLE_ROW(1), EXL3_GEMM2_TABLE_ROW(2), EXL3_GEMM2_TABLE_ROW(3), EXL3_GEMM2_TABLE_ROW(4),
-    EXL3_GEMM2_TABLE_ROW(5), EXL3_GEMM2_TABLE_ROW(6), EXL3_GEMM2_TABLE_ROW(7), EXL3_GEMM2_TABLE_ROW(8)
+    EXL3_GEMM2_TABLE_ROW(fp16, 1), EXL3_GEMM2_TABLE_ROW(fp16, 2), EXL3_GEMM2_TABLE_ROW(fp16, 3), EXL3_GEMM2_TABLE_ROW(fp16, 4),
+    EXL3_GEMM2_TABLE_ROW(fp16, 5), EXL3_GEMM2_TABLE_ROW(fp16, 6), EXL3_GEMM2_TABLE_ROW(fp16, 7), EXL3_GEMM2_TABLE_ROW(fp16, 8)
+};
+static fp_exl3_gemm2_kernel* const tab_gemm2_fp32[9][3] =
+{
+    { nullptr, nullptr, nullptr },
+    EXL3_GEMM2_TABLE_ROW(fp32, 1), EXL3_GEMM2_TABLE_ROW(fp32, 2), EXL3_GEMM2_TABLE_ROW(fp32, 3), EXL3_GEMM2_TABLE_ROW(fp32, 4),
+    EXL3_GEMM2_TABLE_ROW(fp32, 5), EXL3_GEMM2_TABLE_ROW(fp32, 6), EXL3_GEMM2_TABLE_ROW(fp32, 7), EXL3_GEMM2_TABLE_ROW(fp32, 8)
 };
 static fp_exl3_gemm2_kernel* const tab_gemm2_fp16_h[4] =
     { nullptr, tfp_exl3_gemm2_kernel_fp16_h1, tfp_exl3_gemm2_kernel_fp16_h2, tfp_exl3_gemm2_kernel_fp16_h3 };
+static fp_exl3_gemm2_kernel* const tab_gemm2_fp32_h[4] =
+    { nullptr, tfp_exl3_gemm2_kernel_fp32_h1, tfp_exl3_gemm2_kernel_fp32_h2, tfp_exl3_gemm2_kernel_fp32_h3 };
 
-fp_exl3_gemm2_kernel get_gemm2_kernel_ptr(int K, int shape_idx, int cb, bool half_k)
+fp_exl3_gemm2_kernel get_gemm2_kernel_ptr(int K, int shape_idx, int cb, bool half_k, bool c_fp32)
 {
     if (half_k)
     {
         TORCH_CHECK(K >= 1 && K <= 3 && cb == 2, "No kernel for half-integer dual GEMM bitrate");
-        return tab_gemm2_fp16_h[K][shape_idx];
+        return (c_fp32 ? tab_gemm2_fp32_h : tab_gemm2_fp16_h)[K][shape_idx];
     }
     TORCH_CHECK(K >= 1 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for dual GEMM shape");
-    return tab_gemm2_fp16[K][cb][shape_idx];
+    return (c_fp32 ? tab_gemm2_fp32 : tab_gemm2_fp16)[K][cb][shape_idx];
 }
 #endif
 

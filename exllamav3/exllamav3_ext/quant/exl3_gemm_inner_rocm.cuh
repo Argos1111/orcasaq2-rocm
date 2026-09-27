@@ -927,7 +927,8 @@ __device__ void exl3_gemm_kernel_inner
     const uint16_t* __restrict__ B1 = nullptr,
     void* __restrict__ C1 = nullptr,
     const half* post_scale1 = nullptr,
-    const half* pre_scale1 = nullptr   // the second matrix's own input scale (gate/up do not share suh)
+    const half* pre_scale1 = nullptr,  // the second matrix's own input scale (gate/up do not share suh)
+    int size_n1 = 0                    // second matrix width (0: = size_n). Same k and K
 )
 {
     using namespace exl3_rocm_inner;
@@ -938,9 +939,11 @@ __device__ void exl3_gemm_kernel_inner
     float* sh_c = sh;
 
     int tiles_k = size_k / 16;                 // trellis k-subtiles (16 wide)
-    const int tiles_n1 = size_n / TS_N;        // column tiles per matrix
-    int tiles_n = dual ? 2 * tiles_n1 : tiles_n1;
+    const int tiles_n1 = size_n / TS_N;        // column tiles of the first matrix
+    if (size_n1 == 0) size_n1 = size_n;
+    int tiles_n = dual ? tiles_n1 + size_n1 / TS_N : tiles_n1;
     int units = tiles_k * tiles_n;
+    const int nsub0 = n_full / 16, nsub1 = size_n1 / 16;   // B row widths (subtiles) per matrix
     const uint16_t* B0 = B; void* C0 = C; const half* post_scale0 = post_scale; const half* pre_scale0 = pre_scale;
     int num_slices = gridDim.x;
 #if EXL3_ROCM_SLICE_PERMUTE
@@ -1014,7 +1017,10 @@ __device__ void exl3_gemm_kernel_inner
             C = second ? C1 : C0;
             post_scale = second ? post_scale1 : post_scale0;
             pre_scale = second ? pre_scale1 : pre_scale0;
+            c.nsub_total = second ? nsub1 : nsub0;
         }
+        // row stride of B / C / post_scale for the matrix of this column tile
+        const int n_full_c = (dual && vcol >= tiles_n1) ? size_n1 : n_full;
         c.col = col;
         int cols = c.subs_tile * 16;
 
@@ -1164,9 +1170,9 @@ __device__ void exl3_gemm_kernel_inner
                 int m = i / cols;
                 int n = i % cols;
                 if constexpr (c_fp32)
-                    sh_c[i] += ((const float*) C)[(size_t) m * n_full + (size_t) col * TS_N + n];
+                    sh_c[i] += ((const float*) C)[(size_t) m * n_full_c + (size_t) col * TS_N + n];
                 else
-                    sh_c[i] += __half2float(((const half*) C)[(size_t) m * n_full + (size_t) col * TS_N + n]);
+                    sh_c[i] += __half2float(((const half*) C)[(size_t) m * n_full_c + (size_t) col * TS_N + n]);
             }
             __syncthreads();
         }
@@ -1178,9 +1184,9 @@ __device__ void exl3_gemm_kernel_inner
                 int m = i / cols;
                 int n = i % cols;
                 if constexpr (c_fp32)
-                    ((float*) C)[(size_t) m * n_full + (size_t) col * TS_N + n] = sh_c[i];
+                    ((float*) C)[(size_t) m * n_full_c + (size_t) col * TS_N + n] = sh_c[i];
                 else
-                    ((half*) C)[(size_t) m * n_full + (size_t) col * TS_N + n] = __float2half(sh_c[i]);
+                    ((half*) C)[(size_t) m * n_full_c + (size_t) col * TS_N + n] = __float2half(sh_c[i]);
             }
         }
         else if (shmem_out_had)
@@ -1211,7 +1217,7 @@ __device__ void exl3_gemm_kernel_inner
                 const float rs = 0.088388347648f;   // 1/sqrt(128)
                 if (post_scale)
                 {
-                    const half* sb = post_scale + ((size_t) col * TS_N + b * 128) % n_full;
+                    const half* sb = post_scale + ((size_t) col * TS_N + b * 128) % n_full_c;
                     h0 *= rs * __half2float(sb[lane * 4 + 0]);
                     h1 *= rs * __half2float(sb[lane * 4 + 1]);
                     h2 *= rs * __half2float(sb[lane * 4 + 2]);
@@ -1222,7 +1228,7 @@ __device__ void exl3_gemm_kernel_inner
                     h0 *= rs; h1 *= rs; h2 *= rs; h3 *= rs;
                 }
 
-                size_t n0 = (size_t) m * n_full + (size_t) col * TS_N + b * 128 + lane * 4;
+                size_t n0 = (size_t) m * n_full_c + (size_t) col * TS_N + b * 128 + lane * 4;
                 if constexpr (c_fp32)
                 {
                     float* out = (float*) C + n0;
@@ -1243,9 +1249,9 @@ __device__ void exl3_gemm_kernel_inner
                 int m = i / cols;
                 int n = i % cols;
                 if constexpr (c_fp32)
-                    ((float*) C)[(size_t) m * n_full + (size_t) col * TS_N + n] = sh_c[i];
+                    ((float*) C)[(size_t) m * n_full_c + (size_t) col * TS_N + n] = sh_c[i];
                 else
-                    ((half*) C)[(size_t) m * n_full + (size_t) col * TS_N + n] = __float2half(sh_c[i]);
+                    ((half*) C)[(size_t) m * n_full_c + (size_t) col * TS_N + n] = __float2half(sh_c[i]);
             }
         }
 

@@ -78,15 +78,13 @@ void BC_GatedMLP::run_bszN_gr
         // dual GEMM: one launch for gate and up when they share (k, n, K, codebook) and the
         // call is decode-sized. Records GP_gemm_A, GP_gemm_C (gate), GP_gemm2_C1 (up)
         static const bool no_dual = getenv("EXL3_ROCM_NO_GEMM2") != nullptr;
-        const bool dual = !no_dual && num_tokens <= 16 &&
+        bool dual = !no_dual && num_tokens <= 16 &&
             gate->K == up->K && gate->mcg == up->mcg && gate->mul1 == up->mul1 &&
             gate->trellis.sizes() == up->trellis.sizes() && !gate->bias && !up->bias;
-        dual_recorded[num_tokens - 1] = dual;
         if (dual)
-        {
-            exl3_gemm2_gr(x, gate->trellis, g2, gate->svh, gate->suh, up->trellis, u2, up->svh, up->suh, gate->mcg, gate->mul1, -1, 0, graph);
-        }
-        else
+            dual = exl3_gemm2_gr(x, gate->trellis, g2, gate->svh, gate->suh, up->trellis, u2, up->svh, up->suh, gate->mcg, gate->mul1, -1, 0, graph) >= 0;
+        dual_recorded[num_tokens - 1] = dual;
+        if (!dual)
 #endif
         {
         exl3_gemm_gr(x, gate->trellis, g2, gate->suh, gate_xh, gate->svh, -1, gate->mcg, gate->mul1, 0, graph);

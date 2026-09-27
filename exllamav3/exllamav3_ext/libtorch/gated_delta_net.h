@@ -148,6 +148,7 @@ struct BC_GatedDeltaNetSplit
 
     // KDA mode (GLM5.3): b/f_a/g_a fp16 GEMVs off x, low-rank f_b/g_b second stages, per-
     // k-channel decay ("safe gate" when lower_bound != 0), sigmoid-gated norm (z = g_b out)
+    bool qkvz_dual = false;   // ROCm: qkv+z ran as one dual GEMM (graph arg list: one GP_gemm_A for both)
     bool kda = false;
     float lower_bound = 0.0f;
     at::Tensor b_weight_t;        // (Nv, hidden) half

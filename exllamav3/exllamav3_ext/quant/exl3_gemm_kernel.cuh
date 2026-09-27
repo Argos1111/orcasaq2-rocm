@@ -73,12 +73,12 @@ void exl3_gemm_body_kernel(EXL3_GEMM_ARGS)
 // problem. B1 / C1 / svh1 follow the regular argument list. Single 16-row slab only (decode)
 template<EXL3_GEMM_T_ARGS>
 __global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16) EXL3_ROCM_OCC_ATTR
-void exl3_gemm2_body_kernel(EXL3_GEMM_ARGS, const uint16_t* __restrict__ B1, void* __restrict__ C1, const half* __restrict__ svh1, const half* __restrict__ suh1)
+void exl3_gemm2_body_kernel(EXL3_GEMM_ARGS, const uint16_t* __restrict__ B1, void* __restrict__ C1, const half* __restrict__ svh1, const half* __restrict__ suh1, const int size_n1)
 {
     __shared__ float inner_sh[EXL3_INNER_SH_FLOATS(TILESIZE_N)];
     exl3_gemm_kernel_inner
     <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true, true>
-    (A, B, C, size_m, size_k, size_n, locks, svh, 0, inner_sh, suh, locks, B1, C1, svh1, suh1);
+    (A, B, C, size_m, size_k, size_n, locks, svh, 0, inner_sh, suh, locks, B1, C1, svh1, suh1, size_n1);
 }
 #endif
 
