@@ -102,6 +102,10 @@ __device__ __forceinline__ float decode_w_mul1(uint32_t code)
 #ifndef EXL3_ROCM_PAIRED_DOT2
 #define EXL3_ROCM_PAIRED_DOT2 1    // sad_hi_u8 + dot2_f32_f16 epilogue (see phase1_lane)
 #endif
+// 1: one vector load per lane per tile (+ shuffle for the preceding word) instead of NW+1 scalar loads
+#ifndef EXL3_ROCM_VEC_LOAD
+#define EXL3_ROCM_VEC_LOAD 0   // measured: b96 + shuffle is SLOWER than 4 scalar dword loads (38.7 -> 37.8 tok/s; the shuffle sits on the critical path)
+#endif
 #ifndef EXL3_ROCM_ILV
 #define EXL3_ROCM_ILV 8     // codes decoded in lock-step per stage (see phase1_lane)
 #endif
@@ -453,9 +457,41 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
             }
             else
             {
-                a[0] = p32[bw_prev];
-                #pragma unroll
-                for (int k = 0; k < NW; ++k) a[k + 1] = p32[bw + k];
+#if EXL3_ROCM_VEC_LOAD
+                // integer K: the lane's NW words are contiguous and NW*4-byte aligned -> one vector
+                // load (b64 / b96 / b128); the preceding word comes from the neighbouring lane
+                // (lane 0: lane 7's last word = the subtile's last word) via a wave shuffle
+                if constexpr (NW == 3)
+                {
+                    typedef __attribute__((address_space(1))) const uint3 gl_u3;
+                    gl_u3* vp = (gl_u3*) (p32 + bw);
+                    uint3 v; v.x = vp->x; v.y = vp->y; v.z = vp->z;
+                    a[1] = v.x; a[2] = v.y; a[3] = v.z;
+                    a[0] = __shfl(v.z, (lane + 7) & 7, 8);
+                }
+                else if constexpr (NW == 4)
+                {
+                    typedef __attribute__((address_space(1))) const uint4 gl_u4;
+                    gl_u4* vp = (gl_u4*) (p32 + bw);
+                    uint4 v; v.x = vp->x; v.y = vp->y; v.z = vp->z; v.w = vp->w;
+                    a[1] = v.x; a[2] = v.y; a[3] = v.z; a[4] = v.w;
+                    a[0] = __shfl(v.w, (lane + 7) & 7, 8);
+                }
+                else if constexpr (NW == 2)
+                {
+                    typedef __attribute__((address_space(1))) const uint2 gl_u2;
+                    gl_u2* vp = (gl_u2*) (p32 + bw);
+                    uint2 v; v.x = vp->x; v.y = vp->y;
+                    a[1] = v.x; a[2] = v.y;
+                    a[0] = __shfl(v.y, (lane + 7) & 7, 8);
+                }
+                else
+#endif
+                {
+                    a[0] = p32[bw_prev];
+                    #pragma unroll
+                    for (int k = 0; k < NW; ++k) a[k + 1] = p32[bw + k];
+                }
             }
         };
         auto load_x = [&](int t, uint32_t* xw)
@@ -509,9 +545,41 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
             }
             else
             {
-                a[0] = p32[bw_prev];
-                #pragma unroll
-                for (int k = 0; k < NW; ++k) a[k + 1] = p32[bw + k];
+#if EXL3_ROCM_VEC_LOAD
+                // integer K: the lane's NW words are contiguous and NW*4-byte aligned -> one vector
+                // load (b64 / b96 / b128); the preceding word comes from the neighbouring lane
+                // (lane 0: lane 7's last word = the subtile's last word) via a wave shuffle
+                if constexpr (NW == 3)
+                {
+                    typedef __attribute__((address_space(1))) const uint3 gl_u3;
+                    gl_u3* vp = (gl_u3*) (p32 + bw);
+                    uint3 v; v.x = vp->x; v.y = vp->y; v.z = vp->z;
+                    a[1] = v.x; a[2] = v.y; a[3] = v.z;
+                    a[0] = __shfl(v.z, (lane + 7) & 7, 8);
+                }
+                else if constexpr (NW == 4)
+                {
+                    typedef __attribute__((address_space(1))) const uint4 gl_u4;
+                    gl_u4* vp = (gl_u4*) (p32 + bw);
+                    uint4 v; v.x = vp->x; v.y = vp->y; v.z = vp->z; v.w = vp->w;
+                    a[1] = v.x; a[2] = v.y; a[3] = v.z; a[4] = v.w;
+                    a[0] = __shfl(v.w, (lane + 7) & 7, 8);
+                }
+                else if constexpr (NW == 2)
+                {
+                    typedef __attribute__((address_space(1))) const uint2 gl_u2;
+                    gl_u2* vp = (gl_u2*) (p32 + bw);
+                    uint2 v; v.x = vp->x; v.y = vp->y;
+                    a[1] = v.x; a[2] = v.y;
+                    a[0] = __shfl(v.y, (lane + 7) & 7, 8);
+                }
+                else
+#endif
+                {
+                    a[0] = p32[bw_prev];
+                    #pragma unroll
+                    for (int k = 0; k < NW; ++k) a[k + 1] = p32[bw + k];
+                }
             }
             if (c.xl)
             {
