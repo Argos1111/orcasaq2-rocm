@@ -114,6 +114,11 @@ __device__ __forceinline__ float decode_w_mul1(uint32_t code)
 //   2: depth 2 (load t+2 before decode t)               3 buffers of (weights + x)
 //   3: depth 2 for the weights, x just-in-time          3 weight buffers, 1 x buffer
 //   4: two independent half-segment chains, depth 1     4 weight buffers, 1 x buffer, 2 acc sets
+//   5: depth 1, x just-in-time                         (86 VGPRs; slower: ds_load wait lands before the decode)
+//   6: depth 2 via a 2-buffer ring, x jit, 2 acc sets    (91 VGPRs, 4 blocks/CU; = default within noise)
+//   7: as 6 with one acc set                            (87 VGPRs; slower)
+//   8/9: diagnostics (default loop in alternative forms)
+// Measured 2026-09-27 on the lean decode kernel: 1 = 41.3 tok/s, 6 = 41.1, 5 = 40.7, 7 = 40.5, 3 = 40.4
 #ifndef EXL3_ROCM_PIPELINE
 #define EXL3_ROCM_PIPELINE 1
 #endif
@@ -725,7 +730,7 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
         // `for (; t + 1 < t1; t += 2)` form with in-loop conditional loads into a non-terminating
         // loop for the half-integer instances
         const int ntiles = t1 - t0;
-#if EXL3_ROCM_PIPELINE >= 2
+#if EXL3_ROCM_PIPELINE == 2
         // depth 2: three buffers, loads issued two tiles ahead. Fixed trip count (groups of 3)
         // + explicit tail, and NO divergent branches inside the loop: the prefetch index is
         // clamped to the last tile (a redundant in-bounds load) instead of being predicated.
@@ -789,6 +794,91 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
             // chain 1 is at most one tile longer
             if (n1 > half) { load_x(tb0 + half, xA); decode_tile_b(bufA2, xA); }
             acc0 += acc0b; acc1 += acc1b;
+        }
+#elif EXL3_ROCM_PIPELINE == 6
+        // variant 6: weights two tiles ahead with a 2-buffer ring (depth 2 with only 2 buffers:
+        // buffer A is reloaded right after its decode, so the load for tile t+2 is in flight during
+        // the decode of t+1) and x just-in-time; two accumulator pairs alternate per tile
+        {
+            float acc0b = 0.f, acc1b = 0.f;
+            auto decode_tile_b = [&](const uint32_t* a, const uint32_t* xw)
+            {
+                float s0 = acc0, s1 = acc1; acc0 = acc0b; acc1 = acc1b;
+                decode_tile(a, xw);
+                acc0b = acc0; acc1b = acc1; acc0 = s0; acc1 = s1;
+            };
+            const int tlast = t1 - 1;
+            if (ntiles > 0) load_w(t0, bufA);
+            if (ntiles > 1) load_w(t0 + 1, bufB);
+            const int npairs = ntiles / 2;
+            for (int g = 0; g < npairs; ++g)
+            {
+                const int i = g * 2;
+                load_x(t0 + i, xA); decode_tile(bufA, xA);
+                load_w(min(t0 + i + 2, tlast), bufA);
+                load_x(t0 + i + 1, xA); decode_tile_b(bufB, xA);
+                load_w(min(t0 + i + 3, tlast), bufB);
+            }
+            if (ntiles & 1) { load_x(t1 - 1, xA); decode_tile(bufA, xA); }
+            acc0 += acc0b; acc1 += acc1b;
+        }
+#elif EXL3_ROCM_PIPELINE == 5
+        // variant 5: exactly the default depth-1 loop, but x just-in-time (diagnostic)
+        if (ntiles > 0) load_w(t0, bufA);
+        for (int i = 0; i < ntiles; i += 2)
+        {
+            const bool has_b = (i + 1 < ntiles);
+            if (has_b) load_w(t0 + i + 1, bufB);
+            load_x(t0 + i, xA);
+            decode_tile(bufA, xA);
+            if (i + 2 < ntiles) load_w(t0 + i + 2, bufA);
+            if (has_b) { load_x(t0 + i + 1, xA); decode_tile(bufB, xA); }
+        }
+#elif EXL3_ROCM_PIPELINE == 9
+        // variant 9: default loop, load_tile for the weights (x part discarded) + x just-in-time via
+        // load_tile as well (diagnostic: lambda identity vs. schedule)
+        if (ntiles > 0) load_tile(t0, bufA, xA);
+        for (int i = 0; i < ntiles; i += 2)
+        {
+            const bool has_b = (i + 1 < ntiles);
+            if (has_b) load_tile(t0 + i + 1, bufB, xB);
+            decode_tile(bufA, xA);
+            if (i + 2 < ntiles) load_tile(t0 + i + 2, bufA, xA);
+            if (has_b) decode_tile(bufB, xB);
+        }
+#elif EXL3_ROCM_PIPELINE == 8
+        // variant 8: default depth-1 loop with load_tile (w + x buffered) but the `min` clamp form
+        // instead of predicated loads (diagnostic: is it the predication or the x path?)
+        {
+            const int tlast = t1 - 1;
+            if (ntiles > 0) load_tile(t0, bufA, xA);
+            const int npairs = ntiles / 2;
+            for (int g = 0; g < npairs; ++g)
+            {
+                const int i = g * 2;
+                load_tile(t0 + i + 1, bufB, xB);
+                decode_tile(bufA, xA);
+                load_tile(min(t0 + i + 2, tlast), bufA, xA);
+                decode_tile(bufB, xB);
+            }
+            if (ntiles & 1) decode_tile(bufA, xA);
+        }
+#elif EXL3_ROCM_PIPELINE == 7
+        // variant 7: as 6 but a single accumulator pair
+        {
+            const int tlast = t1 - 1;
+            if (ntiles > 0) load_w(t0, bufA);
+            if (ntiles > 1) load_w(t0 + 1, bufB);
+            const int npairs = ntiles / 2;
+            for (int g = 0; g < npairs; ++g)
+            {
+                const int i = g * 2;
+                load_x(t0 + i, xA); decode_tile(bufA, xA);
+                load_w(min(t0 + i + 2, tlast), bufA);
+                load_x(t0 + i + 1, xA); decode_tile(bufB, xA);
+                load_w(min(t0 + i + 3, tlast), bufB);
+            }
+            if (ntiles & 1) { load_x(t1 - 1, xA); decode_tile(bufA, xA); }
         }
 #elif EXL3_ROCM_PIPELINE == 3
         // variant 3: weights two tiles ahead (3 weight buffers), x fetched just-in-time (LDS slice
