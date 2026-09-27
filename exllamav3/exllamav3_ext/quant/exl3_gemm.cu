@@ -299,7 +299,7 @@ int exl3_gemm_gr
         for (int si = 1; si <= EXL3_GEMM_NUM_SHAPES; ++si)
         {
             if (!exl3_gemm_shape_compat(si, size_m, size_k, size_n, K) || fused_min_grid[si] < 0) continue;
-            fp_exl3_gemm_kernel kf = get_gemm_kernel_ptr(K, si, c_fp32, cb, half_k);
+            fp_exl3_gemm_kernel kf = size_m <= 8 ? get_gemmd_kernel_ptr(K, si, c_fp32, cb, half_k) : get_gemm_kernel_ptr(K, si, c_fp32, cb, half_k);
             if (!kf) continue;
             int bps = rocm_gemm_blocks_per_cu((const void*) kf, exl3_gemm_blockdim_g[si], GEMM_DYN_SMEM, size_m, size_n, exl3_gemm_tilesize_n_g[si], num_sms);
             int tilesize_k = exl3_gemm_tilesize_k_g[si];
@@ -418,7 +418,8 @@ int exl3_gemm_gr
         {
             if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K)) continue;
 
-            fp_exl3_gemm_kernel candidate_kernel = get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
+            fp_exl3_gemm_kernel candidate_kernel = size_m <= 8 ? get_gemmd_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k)
+                                                                : get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
             if (!candidate_kernel) continue;
 
             int tilesize_k = exl3_gemm_tilesize_k_g[candidate_shape_idx];
@@ -481,6 +482,9 @@ int exl3_gemm_gr
         &num_sms, cb, half_k
     );
     if (!kernel) return 0;
+#if defined(USE_ROCM)
+    if (size_m <= 8) kernel = get_gemmd_kernel_ptr(K, shape_idx, c_fp32, cb, half_k);
+#endif
 
     // Launch
     if (kernel_attr_set[device].find((void*) kernel) == kernel_attr_set[device].end())

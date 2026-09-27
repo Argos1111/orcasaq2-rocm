@@ -232,6 +232,35 @@ static fp_exl3_gemm2_kernel* const tab_gemm2_fp16_h[4] =
 static fp_exl3_gemm2_kernel* const tab_gemm2_fp32_h[4] =
     { nullptr, tfp_exl3_gemm2_kernel_fp32_h1, tfp_exl3_gemm2_kernel_fp32_h2, tfp_exl3_gemm2_kernel_fp32_h3 };
 
+#define EXL3_GEMMD_TABLE_ROW(fp, K) { tfp_exl3_gemmd_kernel_##fp##_b##K##_cb0, tfp_exl3_gemmd_kernel_##fp##_b##K##_cb1, tfp_exl3_gemmd_kernel_##fp##_b##K##_cb2 }
+static fp_exl3_gemm_kernel* const tab_gemmd_fp16[9][3] =
+{
+    { nullptr, nullptr, nullptr },
+    EXL3_GEMMD_TABLE_ROW(fp16, 1), EXL3_GEMMD_TABLE_ROW(fp16, 2), EXL3_GEMMD_TABLE_ROW(fp16, 3), EXL3_GEMMD_TABLE_ROW(fp16, 4),
+    EXL3_GEMMD_TABLE_ROW(fp16, 5), EXL3_GEMMD_TABLE_ROW(fp16, 6), EXL3_GEMMD_TABLE_ROW(fp16, 7), EXL3_GEMMD_TABLE_ROW(fp16, 8)
+};
+static fp_exl3_gemm_kernel* const tab_gemmd_fp32[9][3] =
+{
+    { nullptr, nullptr, nullptr },
+    EXL3_GEMMD_TABLE_ROW(fp32, 1), EXL3_GEMMD_TABLE_ROW(fp32, 2), EXL3_GEMMD_TABLE_ROW(fp32, 3), EXL3_GEMMD_TABLE_ROW(fp32, 4),
+    EXL3_GEMMD_TABLE_ROW(fp32, 5), EXL3_GEMMD_TABLE_ROW(fp32, 6), EXL3_GEMMD_TABLE_ROW(fp32, 7), EXL3_GEMMD_TABLE_ROW(fp32, 8)
+};
+static fp_exl3_gemm_kernel* const tab_gemmd_fp16_h[4] =
+    { nullptr, tfp_exl3_gemmd_kernel_fp16_h1, tfp_exl3_gemmd_kernel_fp16_h2, tfp_exl3_gemmd_kernel_fp16_h3 };
+static fp_exl3_gemm_kernel* const tab_gemmd_fp32_h[4] =
+    { nullptr, tfp_exl3_gemmd_kernel_fp32_h1, tfp_exl3_gemmd_kernel_fp32_h2, tfp_exl3_gemmd_kernel_fp32_h3 };
+
+fp_exl3_gemm_kernel get_gemmd_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb, bool half_k)
+{
+    if (half_k)
+    {
+        TORCH_CHECK(K >= 1 && K <= 3 && cb == 2, "No kernel for half-integer decode GEMM bitrate");
+        return (c_fp32 ? tab_gemmd_fp32_h : tab_gemmd_fp16_h)[K][shape_idx];
+    }
+    TORCH_CHECK(K >= 1 && K <= 8 && cb >= 0 && cb <= 2, "No kernel for decode GEMM shape");
+    return (c_fp32 ? tab_gemmd_fp32 : tab_gemmd_fp16)[K][cb][shape_idx];
+}
+
 fp_exl3_gemm2_kernel get_gemm2_kernel_ptr(int K, int shape_idx, int cb, bool half_k, bool c_fp32)
 {
     if (half_k)

@@ -974,7 +974,9 @@ __host__ __device__ __forceinline__ bool rocm_ordered_fits(int num_slices, int t
 // shared inner entry point; C is [m][n] with row stride size_n. post_scale
 // applies only when shmem_out_had is set
 
-template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool dual = false>
+// lane_only: decode instance (size_m <= LANE_TIER_MAX_M guaranteed by the host); leaving the warp/dq
+// tier out of the kernel saves ~14 VGPRs (113 -> 99 at 3bpw), i.e. 3 -> 4 blocks/CU at 512 threads
+template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool dual = false, bool lane_only = false>
 __device__ void exl3_gemm_kernel_inner
 (
     const half* __restrict__  A,
@@ -1141,17 +1143,19 @@ __device__ void exl3_gemm_kernel_inner
         constexpr int LANE_TIER_MAX_M = 8;
         // (the host only enables the fused Hadamard for size_m <= LANE_TIER_MAX_M, whose tier
         // reads c.xl; the other tiers read the pre-rotated A)
-        if constexpr (cb == 2 && bits == 4 && !half_k && !EXL3_ROCM_LANE_TIER_ALL)
+        if constexpr (cb == 2 && bits == 4 && !half_k && !EXL3_ROCM_LANE_TIER_ALL && !lane_only)
         {
             phase1_b4c2(c);
         }
-        else if constexpr (cb == 2 && bits == 6 && !half_k && !EXL3_ROCM_LANE_TIER_ALL)
+        else if constexpr (cb == 2 && bits == 6 && !half_k && !EXL3_ROCM_LANE_TIER_ALL && !lane_only)
         {
             phase1_b6c2(c);
         }
         else if constexpr (bits > 0)
         {
-            if (c.size_m <= LANE_TIER_MAX_M)
+            if constexpr (lane_only)
+                phase1_lane<bits, half_k, cb>(c);
+            else if (c.size_m <= LANE_TIER_MAX_M)
                 phase1_lane<bits, half_k, cb>(c);
             else
                 phase1_dq<bits, cb, half_k>(c);

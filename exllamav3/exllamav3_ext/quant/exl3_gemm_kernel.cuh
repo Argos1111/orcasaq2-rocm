@@ -68,6 +68,17 @@ void exl3_gemm_body_kernel(EXL3_GEMM_ARGS)
     }
 }
 
+// Decode body: lane tier only (size_m <= 8, one slab). The host dispatches here for size_m <= 8
+template<EXL3_GEMM_T_ARGS>
+__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16) EXL3_ROCM_OCC_ATTR
+void exl3_gemm_decode_kernel(EXL3_GEMM_ARGS)
+{
+    __shared__ float inner_sh[EXL3_INNER_SH_FLOATS(TILESIZE_N)];
+    exl3_gemm_kernel_inner
+    <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true, false, true>
+    (A, B, C, size_m, size_k, size_n, locks, svh, 0, inner_sh, suh, locks);
+}
+
 // Dual GEMM body (gate/up fusion): two weight matrices of identical (k, n, K) sharing the input
 // (and its fused Hadamard) in one launch: half the launches, and the autotuner sees a 2x wider
 // problem. B1 / C1 / svh1 follow the regular argument list. Single 16-row slab only (decode)
@@ -77,7 +88,7 @@ void exl3_gemm2_body_kernel(EXL3_GEMM_ARGS, const uint16_t* __restrict__ B1, voi
 {
     __shared__ float inner_sh[EXL3_INNER_SH_FLOATS(TILESIZE_N)];
     exl3_gemm_kernel_inner
-    <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true, true>
+    <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true, true, true>
     (A, B, C, size_m, size_k, size_n, locks, svh, 0, inner_sh, suh, locks, B1, C1, svh1, suh1, size_n1);
 }
 #endif
