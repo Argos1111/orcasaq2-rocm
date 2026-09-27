@@ -179,6 +179,14 @@ void gdn_ba_gemv
     at::Tensor& y                   // [.., n] float
 );
 
+void gdn_ba_op3_gr
+(
+    const at::Tensor& x, const at::Tensor& w_t, const c10::optional<at::Tensor>& bias,
+    const at::Tensor& qkv, const at::Tensor& dt_bias, const at::Tensor& a_log,
+    at::Tensor& mixed_qkv, at::Tensor& beta, at::Tensor& g,
+    const float beta_scale, Graph* graph
+);
+
 void gdn_ba_gemv_gr
 (
     const at::Tensor& x,            // [.., k] half

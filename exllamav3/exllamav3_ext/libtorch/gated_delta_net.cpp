@@ -294,6 +294,10 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
                 add_gr(s.z_flat, z_proj->bias.value(), s.z_flat, graph);
         }
 
+#if defined(USE_ROCM)
+        // one launch: b/a GEMV feeding beta/g directly + the qkv bf16 transpose
+        gdn_ba_op3_gr(x, ba_weight_t, ba_bias, s.qkv, dt_bias, a_log, s.mixed_qkv, s.beta, s.g, beta_scale, graph);
+#else
         gdn_ba_gemv_gr(x, ba_weight_t, ba_bias, s.ba, graph);
 
         gated_delta_net_fused_op_3_gr
@@ -304,6 +308,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
             beta_scale,
             graph
         );
+#endif
     }
 
     cuda_causal_conv1d_update_gr

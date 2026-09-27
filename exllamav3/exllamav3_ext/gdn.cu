@@ -1735,6 +1735,111 @@ void gdn_ba_gemv_gr
     cuda_check(cudaPeekAtLastError());
 }
 
+// Fused b/a GEMV + fused_op_3 (ROCm decode path): one launch instead of two. Blocks [0, nba) run the
+// ba GEMV (one warp per output feature, 8 per block) and produce beta / g directly; blocks [nba, ...)
+// run the qkv fp32 -> bf16 transpose. Block-uniform role -> no divergence
+__global__ __launch_bounds__(256)
+void gdn_ba_op3_kernel
+(
+    const half* __restrict__ x,                 // [rows, k] half (rows = B*S)
+    const half* __restrict__ w_t,               // [2H, k] half (b rows then a rows)
+    const half* __restrict__ bias,              // [2H] or null
+    const float* __restrict__ in_qkv,           // [B,S,F]
+    const bfloat16* __restrict__ in_dt_bias,    // [H]
+    const float* __restrict__ in_a_log_f,       // [H] (one of the two)
+    const bfloat16* __restrict__ in_a_log_b,
+    bfloat16* __restrict__ out_mixed_qkv,       // [B,F,S]
+    bfloat16* __restrict__ out_beta,            // [B,S,H]
+    float* __restrict__ out_g,                  // [B,S,H]
+    const int k, const int H, const int BS, const int S, const int F,
+    const int nba_blocks,                       // blocks devoted to the GEMV: rows * ceil(H / 8)
+    const float beta_scale
+)
+{
+    if ((int) blockIdx.x < nba_blocks)
+    {
+        // GEMV: block -> (row r, 8 consecutive heads); warp w computes b[h] AND a[h] for head h
+        // (two dot products over the same x slice: x is read once)
+        const int hb = (H + 7) / 8;
+        const int r = blockIdx.x / hb;
+        const int h = (blockIdx.x % hb) * 8 + threadIdx.x / 32;
+        const int lane = threadIdx.x % 32;
+        if (h >= H) return;
+        const uint4* x4 = (const uint4*) (x + (size_t) r * k);
+        const uint4* wb = (const uint4*) (w_t + (size_t) h * k);
+        const uint4* wa = (const uint4*) (w_t + (size_t) (H + h) * k);
+        float sb0 = 0.f, sb1 = 0.f, sa0 = 0.f, sa1 = 0.f;
+        const int n4 = k / 8;
+        for (int j = lane; j < n4; j += 32)
+        {
+            uint4 xv = x4[j], bv = wb[j], av = wa[j];
+            float2 xa, wv;
+            xa = __half22float2(*(half2*) &xv.x); wv = __half22float2(*(half2*) &bv.x); sb0 = fmaf(xa.x, wv.x, sb0); sb1 = fmaf(xa.y, wv.y, sb1); wv = __half22float2(*(half2*) &av.x); sa0 = fmaf(xa.x, wv.x, sa0); sa1 = fmaf(xa.y, wv.y, sa1);
+            xa = __half22float2(*(half2*) &xv.y); wv = __half22float2(*(half2*) &bv.y); sb0 = fmaf(xa.x, wv.x, sb0); sb1 = fmaf(xa.y, wv.y, sb1); wv = __half22float2(*(half2*) &av.y); sa0 = fmaf(xa.x, wv.x, sa0); sa1 = fmaf(xa.y, wv.y, sa1);
+            xa = __half22float2(*(half2*) &xv.z); wv = __half22float2(*(half2*) &bv.z); sb0 = fmaf(xa.x, wv.x, sb0); sb1 = fmaf(xa.y, wv.y, sb1); wv = __half22float2(*(half2*) &av.z); sa0 = fmaf(xa.x, wv.x, sa0); sa1 = fmaf(xa.y, wv.y, sa1);
+            xa = __half22float2(*(half2*) &xv.w); wv = __half22float2(*(half2*) &bv.w); sb0 = fmaf(xa.x, wv.x, sb0); sb1 = fmaf(xa.y, wv.y, sb1); wv = __half22float2(*(half2*) &av.w); sa0 = fmaf(xa.x, wv.x, sa0); sa1 = fmaf(xa.y, wv.y, sa1);
+        }
+        float sb = sb0 + sb1, sa = sa0 + sa1;
+        for (int offset = 16; offset > 0; offset >>= 1) { sb += __shfl_down_sync(0xffffffff, sb, offset); sa += __shfl_down_sync(0xffffffff, sa, offset); }
+        if (lane == 0)
+        {
+            if (bias) { sb += __half2float(bias[h]); sa += __half2float(bias[H + h]); }
+            const float beta = _sigmoid_fast_exp(sb) * beta_scale;
+            const float dt_bias = as_float(in_dt_bias[h]);
+            const float al = in_a_log_f ? in_a_log_f[h] : as_float(in_a_log_b[h]);
+            const float gv = -softplus(sa + dt_bias) * __expf(al);
+            out_beta[(size_t) r * H + h] = trunc_bf16(beta);
+            out_g[(size_t) r * H + h] = gv;
+        }
+    }
+    else
+    {
+        int idx = (blockIdx.x - nba_blocks) * blockDim.x + threadIdx.x;
+        if (idx >= BS * F) return;
+        int f = idx % F, row = idx / F, b = row / S, s_ = row % S;
+        out_mixed_qkv[((size_t) b * F + f) * S + s_] = trunc_bf16(in_qkv[idx]);
+    }
+}
+
+void gdn_ba_op3_gr
+(
+    const at::Tensor& x, const at::Tensor& w_t, const c10::optional<at::Tensor>& bias,
+    const at::Tensor& qkv, const at::Tensor& dt_bias, const at::Tensor& a_log,
+    at::Tensor& mixed_qkv, at::Tensor& beta, at::Tensor& g,
+    const float beta_scale, Graph* graph
+)
+{
+    const at::cuda::OptionalCUDAGuard device_guard(x.device());
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
+    TORCH_CHECK_DTYPE(x, kHalf); TORCH_CHECK_DTYPE(w_t, kHalf); TORCH_CHECK_DTYPE(qkv, kFloat);
+    TORCH_CHECK_DTYPE(dt_bias, kBFloat16); TORCH_CHECK_DTYPE(mixed_qkv, kBFloat16); TORCH_CHECK_DTYPE(beta, kBFloat16); TORCH_CHECK_DTYPE(g, kFloat);
+    const int k = x.size(-1);
+    const int H = beta.size(-1);
+    const int B = qkv.size(0), S = qkv.size(1), F = qkv.size(2), BS = B * S;
+    TORCH_CHECK(w_t.dim() == 2 && w_t.size(0) == 2 * H && w_t.size(1) == k, "gdn_ba_op3: w_t must be [2H, k]");
+    TORCH_CHECK((int) (x.numel() / k) == BS, "gdn_ba_op3: rows mismatch");
+    TORCH_CHECK(k % 8 == 0, "gdn_ba_op3: k must be a multiple of 8");
+    const int hb = (H + 7) / 8;
+    const int nba = BS * hb;
+    const int ncast = CEIL_DIVIDE(BS * F, 256);
+    const bool a_log_fp32 = a_log.dtype() == at::kFloat;
+    TORCH_CHECK(a_log_fp32 || a_log.dtype() == at::kBFloat16, "gdn_ba_op3: unsupported a_log dtype");
+    gdn_ba_op3_kernel<<<nba + ncast, 256, 0, stream>>>
+    (
+        (const half*) x.data_ptr(), (const half*) w_t.data_ptr(), (const half*) OPTPTR(bias),
+        (const float*) qkv.data_ptr(), (const bfloat16*) dt_bias.data_ptr(),
+        a_log_fp32 ? (const float*) a_log.data_ptr() : nullptr, a_log_fp32 ? nullptr : (const bfloat16*) a_log.data_ptr(),
+        (bfloat16*) mixed_qkv.data_ptr(), (bfloat16*) beta.data_ptr(), (float*) g.data_ptr(),
+        k, H, BS, S, F, nba, beta_scale
+    );
+    if (graph)
+    {
+        graph->record_param((void*) &gdn_ba_op3_kernel, GP_gdn_ba_x, 0);
+        graph->record_param((void*) &gdn_ba_op3_kernel, GP_end, 0);
+    }
+    cuda_check(cudaPeekAtLastError());
+}
+
 #define LR_GEMV_WARPS 8
 
 // Float-input fp16-weight GEMV for the KDA low-rank second stages (f_b/g_b): x is a graph
