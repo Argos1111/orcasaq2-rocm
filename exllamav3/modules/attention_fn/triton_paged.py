@@ -1853,7 +1853,9 @@ def paged_attn_triton_prefill(
     if hd_pad <= 128:
         cfg = (128, 32, 8, 2) if blackwell else (128, 64, 8, 2)
     elif hd_pad <= 256:
-        cfg = (64, 32, 8, 2)
+        # gfx1100 (64 KB LDS, wave32): BM 128 / BN 32 measured 2.5x the BM 64 config at
+        # head_dim 256 (54 vs 21 TFLOPS on RX 7900 XTX, q 2048 x kv 34k)
+        cfg = (128, 32, 8, 2) if torch.version.hip else (64, 32, 8, 2)
     else:
         cfg = (32, 16, 4, 2)
     num_stages_forced = num_stages is not None
