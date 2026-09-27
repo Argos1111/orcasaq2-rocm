@@ -61,12 +61,14 @@ struct ProbeEntry { const void* fn; int num_regs; };
 
 // VGPR ladder (numRegs reported by cudaFuncGetAttributes = NV + ~4)
 #define PROBE(n) { (const void*) coresidency_probe<n>, 0 }
+// NV = 8k - 4 so that numRegs (NV + ~4 bookkeeping) lands ON the 8-register allocation boundaries:
+// a target of exactly 96 VGPRs (16 waves/SIMD) must not be probed with a 100-register kernel (14)
 ProbeEntry g_probes[] =
 {
-    PROBE(8),   PROBE(16),  PROBE(24),  PROBE(32),  PROBE(40),  PROBE(48),  PROBE(56),  PROBE(64),
-    PROBE(72),  PROBE(80),  PROBE(88),  PROBE(96),  PROBE(104), PROBE(112), PROBE(120), PROBE(128),
-    PROBE(136), PROBE(144), PROBE(152), PROBE(160), PROBE(168), PROBE(176), PROBE(184), PROBE(192),
-    PROBE(208), PROBE(224), PROBE(240), PROBE(248)
+    PROBE(4),   PROBE(12),  PROBE(20),  PROBE(28),  PROBE(36),  PROBE(44),  PROBE(52),  PROBE(60),
+    PROBE(68),  PROBE(76),  PROBE(84),  PROBE(92),  PROBE(100), PROBE(108), PROBE(116), PROBE(124),
+    PROBE(132), PROBE(140), PROBE(148), PROBE(156), PROBE(164), PROBE(172), PROBE(180), PROBE(188),
+    PROBE(196), PROBE(204), PROBE(212), PROBE(220), PROBE(228), PROBE(236), PROBE(244), PROBE(252)
 };
 #undef PROBE
 constexpr int NUM_PROBES = sizeof(g_probes) / sizeof(g_probes[0]);
@@ -107,10 +109,11 @@ int rocm_coresident_blocks_per_cu(const void* kernel, int block_dim, int dyn_sme
     const int target_regs = fa.numRegs;
     const int target_lds = (int) fa.sharedSizeBytes + dyn_smem;
 
-    // smallest probe with >= the target's VGPR count (conservative: more registers = fewer waves)
+    // smallest probe whose VGPR ALLOCATION (8-register granularity on gfx11) is >= the target's
     const void* probe = nullptr;
+    const int target_alloc = (target_regs + 7) / 8 * 8;
     for (int i = 0; i < NUM_PROBES; ++i)
-        if (g_probes[i].num_regs >= target_regs) { probe = g_probes[i].fn; break; }
+        if ((g_probes[i].num_regs + 7) / 8 * 8 >= target_alloc) { probe = g_probes[i].fn; break; }
     if (!probe) probe = g_probes[NUM_PROBES - 1].fn;
 
     int num_cus = 0;

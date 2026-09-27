@@ -428,8 +428,19 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
 #ifdef EXL3_ROCM_BOUNDS
             if (t < c.kt0 || t >= c.kt1 || t < t0 || t >= t1 || t * 16 >= c.size_k) __builtin_trap();
 #endif
+#ifdef EXL3_ROCM_EXPERIMENT_FAKE_LOAD
+            // experiment: no global weight loads (VALU ceiling); words derived from t and the lane
+            const bool fake = true;
+#else
+            const bool fake = false;
+#endif
             const uint32_t* p32 = base + (size_t) (t - c.kt0) * (c.nsub_total * SUB_U32);
-            if constexpr (half_k)
+            if (fake)
+            {
+                #pragma unroll
+                for (int k = 0; k <= NW; ++k) a[k] = (uint32_t) (t * 2654435761u) ^ (lane * 40503u + k * 0x9E3779B9u);
+            }
+            else if constexpr (half_k)
             {
                 uint32_t w[NW + 2];
                 w[0] = p32[bw_prev];
@@ -473,8 +484,19 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
             // process abort) instead of an unmapped read that hangs the GPU / the whole machine
             if (t < c.kt0 || t >= c.kt1 || t < t0 || t >= t1 || t * 16 >= c.size_k) __builtin_trap();
 #endif
+#ifdef EXL3_ROCM_EXPERIMENT_FAKE_LOAD
+            // experiment: no global weight loads (VALU ceiling); words derived from t and the lane
+            const bool fake = true;
+#else
+            const bool fake = false;
+#endif
             const uint32_t* p32 = base + (size_t) (t - c.kt0) * (c.nsub_total * SUB_U32);
-            if constexpr (half_k)
+            if (fake)
+            {
+                #pragma unroll
+                for (int k = 0; k <= NW; ++k) a[k] = (uint32_t) (t * 2654435761u) ^ (lane * 40503u + k * 0x9E3779B9u);
+            }
+            else if constexpr (half_k)
             {
                 uint32_t w[NW + 2];
                 w[0] = p32[bw_prev];
@@ -512,6 +534,13 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
 
         auto decode_tile = [&](const uint32_t* a, const uint32_t* xw)
         {
+#ifdef EXL3_ROCM_EXPERIMENT_NO_DECODE
+            // experiment: keep the loads, replace the decode by a trivial consume (bandwidth ceiling)
+            { float s = 0.f;
+              #pragma unroll
+              for (int k = 0; k <= NW; ++k) s += __uint_as_float(a[k] & 0x3FFFFFFFu);
+              acc0 += s * __uint_as_float(xw[0] | 0x3F800000u); acc1 += s; return; }
+#endif
 
             if constexpr (cb == 2)
             {

@@ -31,8 +31,19 @@ __global__ void exl3_gemm_had_kernel
 // GEMM body. With EXL3_ROCM_FUSED_HAD, A is the RAW input and each block rotates its own k slice
 // (scaled by suh) into LDS; otherwise A is the caller's A_had and suh is passed as nullptr. The
 // argument list (and so the graph parameter indices) matches the cooperative kernel's
+// EXL3_ROCM_WAVES_PER_EU: ask the compiler for at least this many waves per SIMD (caps the VGPR
+// budget: 1536 / (8 * n) rounded). 0 = compiler default
+#ifndef EXL3_ROCM_WAVES_PER_EU
+#define EXL3_ROCM_WAVES_PER_EU 0
+#endif
+#if EXL3_ROCM_WAVES_PER_EU > 0
+#define EXL3_ROCM_OCC_ATTR __attribute__((amdgpu_waves_per_eu(EXL3_ROCM_WAVES_PER_EU, EXL3_ROCM_WAVES_PER_EU)))
+#else
+#define EXL3_ROCM_OCC_ATTR
+#endif
+
 template<EXL3_GEMM_T_ARGS>
-__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
+__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16) EXL3_ROCM_OCC_ATTR
 void exl3_gemm_body_kernel(EXL3_GEMM_ARGS)
 {
     __shared__ float inner_sh[EXL3_INNER_SH_FLOATS(TILESIZE_N)];
@@ -61,7 +72,7 @@ void exl3_gemm_body_kernel(EXL3_GEMM_ARGS)
 // (and its fused Hadamard) in one launch: half the launches, and the autotuner sees a 2x wider
 // problem. B1 / C1 / svh1 follow the regular argument list. Single 16-row slab only (decode)
 template<EXL3_GEMM_T_ARGS>
-__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16)
+__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16) EXL3_ROCM_OCC_ATTR
 void exl3_gemm2_body_kernel(EXL3_GEMM_ARGS, const uint16_t* __restrict__ B1, void* __restrict__ C1, const half* __restrict__ svh1, const half* __restrict__ suh1)
 {
     __shared__ float inner_sh[EXL3_INNER_SH_FLOATS(TILESIZE_N)];
