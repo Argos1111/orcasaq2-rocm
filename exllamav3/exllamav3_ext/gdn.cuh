@@ -184,7 +184,9 @@ void gdn_ba_op3_gr
     const at::Tensor& x, const at::Tensor& w_t, const c10::optional<at::Tensor>& bias,
     const at::Tensor& qkv, const at::Tensor& dt_bias, const at::Tensor& a_log,
     at::Tensor& mixed_qkv, at::Tensor& beta, at::Tensor& g,
-    const float beta_scale, Graph* graph
+    const float beta_scale, Graph* graph,
+    at::Tensor* conv_state = nullptr, const c10::optional<at::Tensor>& conv_slots = {}, const at::Tensor* conv_w = nullptr,
+    const c10::optional<at::Tensor>& conv_bias = {}, at::Tensor* conv_out = nullptr
 );
 
 void gdn_ba_gemv_gr

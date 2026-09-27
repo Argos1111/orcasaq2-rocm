@@ -1753,7 +1753,14 @@ void gdn_ba_op3_kernel
     float* __restrict__ out_g,                  // [B,S,H]
     const int k, const int H, const int BS, const int S, const int F,
     const int nba_blocks,                       // blocks devoted to the GEMV: rows * ceil(H / 8)
-    const float beta_scale
+    const float beta_scale,
+    // optional fused conv1d update (seqlen == 1, no history): non-null conv_state enables it
+    bfloat16* __restrict__ conv_state,          // (num_slots, F, state_size)
+    const int* __restrict__ conv_slots,         // (B) or null
+    const bfloat16* __restrict__ conv_w,        // (F, K)
+    const bfloat16* __restrict__ conv_bias,     // (F) or null
+    bfloat16* __restrict__ out_conv,            // (B, 1, F)
+    const int conv_state_size, const int conv_K
 )
 {
     if ((int) blockIdx.x < nba_blocks)
@@ -1792,12 +1799,45 @@ void gdn_ba_op3_kernel
             out_g[(size_t) r * H + h] = gv;
         }
     }
-    else
+    else if (!conv_state)
     {
         int idx = (blockIdx.x - nba_blocks) * blockDim.x + threadIdx.x;
         if (idx >= BS * F) return;
         int f = idx % F, row = idx / F, b = row / S, s_ = row % S;
         out_mixed_qkv[((size_t) b * F + f) * S + s_] = trunc_bf16(in_qkv[idx]);
+    }
+    else
+    {
+        // seqlen == 1, no history: the causal conv1d update reads the current input straight from
+        // the fp32 qkv (the bf16 transpose is folded in: mixed_qkv is not materialised), computes
+        // out = silu(conv) and shifts the state. One thread per channel, block-uniform batch row
+        const int idx = (blockIdx.x - nba_blocks) * blockDim.x + threadIdx.x;
+        if (idx >= BS * F) return;
+        const int d = idx % F, b = idx / F;
+        const int slot = conv_slots ? conv_slots[b] : b;
+        bfloat16* state_d = conv_state + ((size_t) slot * F + d) * conv_state_size;
+        const float xin = untrunc_bf16(trunc_bf16(in_qkv[(size_t) b * F + d]));   // same rounding as the transpose path
+        float acc = conv_bias ? __bfloat162float(conv_bias[d]) : 0.f;
+        float old_k[CONV1D_MAX_K];
+        #pragma unroll
+        for (int k = 0; k < CONV1D_MAX_K; ++k)
+            if (k < conv_K) old_k[k] = __bfloat162float(state_d[k]);
+        #pragma unroll
+        for (int k = 0; k < CONV1D_MAX_K; ++k)
+        {
+            if (k < conv_K)
+            {
+                const float wk = __bfloat162float(conv_w[(size_t) d * conv_K + k]);
+                const float v = (k < conv_K - 1) ? old_k[k + 1] : xin;
+                acc = fmaf(wk, v, acc);
+            }
+        }
+        acc *= _sigmoid_fast_exp(acc);
+        out_conv[(size_t) b * F + d] = __float2bfloat16_rn(acc);
+        // shift the window: state[k] = state[k+1], state[K-1] = x
+        #pragma unroll
+        for (int k = 0; k < CONV1D_MAX_K; ++k)
+            if (k < conv_K) state_d[k] = __float2bfloat16_rn((k < conv_K - 1) ? old_k[k + 1] : xin);
     }
 }
 
@@ -1806,7 +1846,9 @@ void gdn_ba_op3_gr
     const at::Tensor& x, const at::Tensor& w_t, const c10::optional<at::Tensor>& bias,
     const at::Tensor& qkv, const at::Tensor& dt_bias, const at::Tensor& a_log,
     at::Tensor& mixed_qkv, at::Tensor& beta, at::Tensor& g,
-    const float beta_scale, Graph* graph
+    const float beta_scale, Graph* graph,
+    at::Tensor* conv_state, const c10::optional<at::Tensor>& conv_slots, const at::Tensor* conv_w,
+    const c10::optional<at::Tensor>& conv_bias, at::Tensor* conv_out
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -1824,17 +1866,38 @@ void gdn_ba_op3_gr
     const int ncast = CEIL_DIVIDE(BS * F, 256);
     const bool a_log_fp32 = a_log.dtype() == at::kFloat;
     TORCH_CHECK(a_log_fp32 || a_log.dtype() == at::kBFloat16, "gdn_ba_op3: unsupported a_log dtype");
+    const bool fuse_conv = conv_state != nullptr;
+    int conv_state_size = 0, conv_K = 0;
+    if (fuse_conv)
+    {
+        TORCH_CHECK(S == 1, "gdn_ba_op3: fused conv1d requires seqlen == 1");
+        TORCH_CHECK(conv_w && conv_out, "gdn_ba_op3: fused conv1d needs weight and output");
+        conv_state_size = conv_state->size(2); conv_K = conv_w->size(1);
+        TORCH_CHECK(conv_K <= CONV1D_MAX_K && conv_state_size >= conv_K && conv_state->size(1) == F, "gdn_ba_op3: conv shapes");
+        TORCH_CHECK(conv_slots.has_value() || conv_state->size(0) >= B, "gdn_ba_op3: conv slots");
+    }
     gdn_ba_op3_kernel<<<nba + ncast, 256, 0, stream>>>
     (
         (const half*) x.data_ptr(), (const half*) w_t.data_ptr(), (const half*) OPTPTR(bias),
         (const float*) qkv.data_ptr(), (const bfloat16*) dt_bias.data_ptr(),
         a_log_fp32 ? (const float*) a_log.data_ptr() : nullptr, a_log_fp32 ? nullptr : (const bfloat16*) a_log.data_ptr(),
         (bfloat16*) mixed_qkv.data_ptr(), (bfloat16*) beta.data_ptr(), (float*) g.data_ptr(),
-        k, H, BS, S, F, nba, beta_scale
+        k, H, BS, S, F, nba, beta_scale,
+        fuse_conv ? (bfloat16*) conv_state->data_ptr() : nullptr,
+        fuse_conv ? (const int*) OPTPTR(conv_slots) : nullptr,
+        fuse_conv ? (const bfloat16*) conv_w->data_ptr() : nullptr,
+        fuse_conv ? (const bfloat16*) OPTPTR(conv_bias) : nullptr,
+        fuse_conv ? (bfloat16*) conv_out->data_ptr() : nullptr,
+        conv_state_size, conv_K
     );
     if (graph)
     {
         graph->record_param((void*) &gdn_ba_op3_kernel, GP_gdn_ba_x, 0);
+        if (fuse_conv)
+        {
+            graph->record_param((void*) &gdn_ba_op3_kernel, GP_conv1d_state, 17);
+            graph->record_param((void*) &gdn_ba_op3_kernel, GP_conv1d_slots, 18);
+        }
         graph->record_param((void*) &gdn_ba_op3_kernel, GP_end, 0);
     }
     cuda_check(cudaPeekAtLastError());
