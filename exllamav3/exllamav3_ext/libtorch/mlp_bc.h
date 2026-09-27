@@ -37,7 +37,8 @@ py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
     py::arg("down"),
     py::arg("act_limit")
 )
-.def("run_bszN", &BC_GatedMLP::run_bszN);
+.def("run_bszN", &BC_GatedMLP::run_bszN)
+.def("run_bszN_resid", &BC_GatedMLP::run_bszN_resid, py::arg("x"), py::arg("d"), py::arg("residual"), py::arg("norm_w") = py::none(), py::arg("norm_out") = py::none(), py::arg("norm_eps") = 1e-6f, py::arg("norm_bias") = 0.f, py::arg("norm_scale") = 1.f);
 
 py::class_<BC_MLP, std::shared_ptr<BC_MLP>>(m, "BC_MLP").def
 (

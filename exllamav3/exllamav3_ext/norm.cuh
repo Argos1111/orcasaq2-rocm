@@ -39,6 +39,19 @@ void rms_norm_res_in
     float constant_scale
 );
 
+// graphable RES_IN variant: r += x; y = rmsnorm(r). Records GP_norm_x / GP_norm_y / GP_norm_r
+void rms_norm_res_in_gr
+(
+    at::Tensor x,
+    c10::optional<at::Tensor> w,
+    at::Tensor y,
+    at::Tensor r,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    Graph* graph
+);
+
 void gated_rms_norm
 (
     at::Tensor x,

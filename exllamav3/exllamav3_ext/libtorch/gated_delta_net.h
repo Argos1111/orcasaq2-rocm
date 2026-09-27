@@ -189,6 +189,7 @@ struct BC_GatedDeltaNetSplit
         int graph_hist_stride = -1;
 
         std::unique_ptr<Graph> graph;
+        std::unique_ptr<Graph> graph_resid;   // variant with the residual/norm epilogue (r += y; n = rmsnorm(r))
     };
     std::vector<Slot> slots;        // history == false (only seqlen == 1 ever populated)
     std::vector<Slot> slots_hist;   // history == true
@@ -336,7 +337,11 @@ struct BC_GatedDeltaNetSplit
         const at::Tensor& slots,
         bool history,
         Slot& s,
-        Graph* graph
+        Graph* graph,
+        const c10::optional<at::Tensor>& residual = {},   // residual += y; norm_out = rmsnorm(residual) * norm_w
+        const c10::optional<at::Tensor>& norm_w = {},
+        const c10::optional<at::Tensor>& norm_out = {},
+        float norm_eps = 1e-6f, float norm_bias = 0.f, float norm_scale = 1.f
     );
 
     void run_bszN
@@ -347,6 +352,21 @@ struct BC_GatedDeltaNetSplit
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
         bool history
+    );
+
+    // as run_bszN + fused residual add and next-layer input RMSNorm in the same graph
+    void run_bszN_resid
+    (
+        const at::Tensor& x,
+        at::Tensor& y,
+        at::Tensor& conv_state,
+        at::Tensor& recurrent_state,
+        const at::Tensor& slots,
+        bool history,
+        at::Tensor& residual,
+        const at::Tensor& norm_w,
+        at::Tensor& norm_out,
+        float norm_eps, float norm_bias, float norm_scale
     );
 };
 

@@ -8,6 +8,7 @@
 #include "../quant/exl3_gemm.cuh"
 #include "../gdn.cuh"
 #include "../add.cuh"
+#include "../norm.cuh"
 
 using namespace torch::indexing;
 
@@ -222,7 +223,11 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     const at::Tensor& slots,
     bool history,
     Slot& s,
-    Graph* graph
+    Graph* graph,
+    const c10::optional<at::Tensor>& residual,
+    const c10::optional<at::Tensor>& norm_w,
+    const c10::optional<at::Tensor>& norm_out,
+    float norm_eps, float norm_bias, float norm_scale
 )
 {
     int R = (int) (x.size(0) * x.size(1));
@@ -321,6 +326,75 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     exl3_gemm_gr(s.core_attn_out_f, o_proj->trellis, y, o_proj->suh, s.o_xh, o_proj->svh, -1, o_proj->mcg, o_proj->mul1, 0, graph);
     if (o_proj->bias)
         add_gr(y, o_proj->bias.value(), y, graph);
+    if (residual)
+    {
+        at::Tensor r = residual.value();
+        at::Tensor n = norm_out.value();
+        rms_norm_res_in_gr(y, norm_w, n, r, norm_eps, norm_bias, norm_scale, graph);
+    }
+}
+
+void BC_GatedDeltaNetSplit::run_bszN_resid
+(
+    const at::Tensor& x,
+    at::Tensor& y,
+    at::Tensor& conv_state,
+    at::Tensor& recurrent_state,
+    const at::Tensor& slots,
+    bool history,
+    at::Tensor& residual,
+    const at::Tensor& norm_w,
+    at::Tensor& norm_out,
+    float norm_eps, float norm_bias, float norm_scale
+)
+{
+    py::gil_scoped_release release;
+    c10::cuda::CUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    int bsz = (int) x.size(0);
+    int seqlen = (int) x.size(1);
+    TORCH_CHECK(bsz >= 1 && bsz <= MAX_BSZ && seqlen >= 1 && seqlen <= MAX_QLEN, "BC_GatedDeltaNetSplit::run_bszN_resid: shape out of range");
+    Slot& s = slot(bsz, seqlen, history);
+    TORCH_CHECK(s.configured, "BC_GatedDeltaNetSplit::run_bszN_resid: slot not configured");
+    if (!s.graph_resid) s.graph_resid = std::make_unique<Graph>();
+    Graph& g = *s.graph_resid;
+    // same warm-up protocol as run_bszN (eager twice, then capture), sharing the geometry snapshot
+    if (g.disabled || (!g.ready && !g.ready_to_record))
+    {
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr, residual, norm_w, norm_out, norm_eps, norm_bias, norm_scale);
+        g.ready_to_record = true;
+        s.graph_state_size = (int) conv_state.size(2);
+        s.graph_hist_stride = (int) recurrent_state.size(1);
+        return;
+    }
+    if ((int) conv_state.size(2) != s.graph_state_size || (int) recurrent_state.size(1) != s.graph_hist_stride)
+    {
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr, residual, norm_w, norm_out, norm_eps, norm_bias, norm_scale);
+        return;
+    }
+    if (!g.ready)
+    {
+        g.capture_begin();
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, &g, residual, norm_w, norm_out, norm_eps, norm_bias, norm_scale);
+        g.capture_end();
+    }
+    std::vector<PPTR> args;
+    if (kda)
+        args = { PPTR(GP_gemm_A, (void*) x.data_ptr()), PPTR(GP_gdn_ba_x, (void*) x.data_ptr()), PPTR(GP_gdn_ba_x, (void*) x.data_ptr()), PPTR(GP_gdn_ba_x, (void*) x.data_ptr()),
+                 PPTR(GP_conv1d_state, (void*) conv_state.data_ptr()), PPTR(GP_conv1d_slots, (void*) slots.data_ptr()),
+                 PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()), PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()), PPTR(GP_gemm_C, (void*) y.data_ptr()) };
+    else if (qkvz_ptrs_trellis.has_value() && (int) (x.size(0) * x.size(1)) <= 32)
+        args = { PPTR(GP_mgemm_A, (void*) x.data_ptr()), PPTR(GP_gdn_ba_x, (void*) x.data_ptr()),
+                 PPTR(GP_conv1d_state, (void*) conv_state.data_ptr()), PPTR(GP_conv1d_slots, (void*) slots.data_ptr()),
+                 PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()), PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()), PPTR(GP_gemm_C, (void*) y.data_ptr()) };
+    else
+        args = { PPTR(GP_gemm_A, (void*) x.data_ptr()), PPTR(GP_gemm_A, (void*) x.data_ptr()), PPTR(GP_gdn_ba_x, (void*) x.data_ptr()),
+                 PPTR(GP_conv1d_state, (void*) conv_state.data_ptr()), PPTR(GP_conv1d_slots, (void*) slots.data_ptr()),
+                 PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()), PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()), PPTR(GP_gemm_C, (void*) y.data_ptr()) };
+    args.emplace_back(GP_norm_x, (void*) y.data_ptr());
+    args.emplace_back(GP_norm_y, (void*) norm_out.data_ptr());
+    args.emplace_back(GP_norm_r, (void*) residual.data_ptr());
+    g.launch(args, stream);
 }
 
 void BC_GatedDeltaNetSplit::run_bszN

@@ -99,7 +99,11 @@ struct BC_GatedMLP
         const at::Tensor& x,
         at::Tensor& d,
         int num_tokens,
-        Graph* graph
+        Graph* graph,
+        const c10::optional<at::Tensor>& residual = {},   // residual += d, recorded in the same graph
+        const c10::optional<at::Tensor>& norm_w = {},     // then norm_out = rmsnorm(residual) * norm_w (next layer's input norm)
+        const c10::optional<at::Tensor>& norm_out = {},
+        float norm_eps = 1e-6f, float norm_bias = 0.f, float norm_scale = 1.f
     );
 
     void run_bszN
@@ -107,6 +111,20 @@ struct BC_GatedMLP
         const at::Tensor& x,
         at::Tensor& d
     );
+
+    // as run_bszN, plus residual += d inside the graph (the Python-side `x += y` launch and its
+    // host gap disappear). Graphs with and without the residual are separate
+    void run_bszN_resid
+    (
+        const at::Tensor& x,
+        at::Tensor& d,
+        at::Tensor& residual,
+        const c10::optional<at::Tensor>& norm_w,
+        const c10::optional<at::Tensor>& norm_out,
+        float norm_eps, float norm_bias, float norm_scale
+    );
+    bool resid_recorded[MAX_BSZN] = {};
+    std::vector<Graph> graph_bszN_resid = std::vector<Graph>(MAX_BSZN);
 };
 
 

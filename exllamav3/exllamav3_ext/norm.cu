@@ -327,7 +327,8 @@ void rms_norm_impl
     bool span_heads,
     int res_mode,
     Graph* graph = nullptr,
-    int w_groups = 1
+    int w_groups = 1,
+    bool record = false
 )
 {
     const at::cuda::OptionalCUDAGuard device_guard(x.device());
@@ -384,6 +385,7 @@ void rms_norm_impl
     // Launch macro
     #define __(_tx, __tx, _tw, __tw, _ty, __ty, _res, _tr, __tr)                                   \
     if (tx == at::_tx && tw == at::_tw && ty == at::_ty && res_mode == _res && tr == at::_tr)      \
+    {                                                                                              \
         rms_norm_kernel<_res, __tx, __ty, __tw, __tr><<<gridDim, blockDim, 0, stream>>>            \
         (                                                                                          \
             (const __tx*) x.data_ptr(),                                                            \
@@ -396,7 +398,15 @@ void rms_norm_impl
             constant_bias,                                                          \
             constant_scale,                                                         \
             w_groups                                                                \
-        );
+        );                                                                          \
+        if (graph && record)                                                        \
+        {                                                                           \
+            graph->record_param((void*) &rms_norm_kernel<_res, __tx, __ty, __tw, __tr>, GP_norm_x, 0); \
+            graph->record_param((void*) &rms_norm_kernel<_res, __tx, __ty, __tw, __tr>, GP_norm_y, 2); \
+            graph->record_param((void*) &rms_norm_kernel<_res, __tx, __ty, __tw, __tr>, GP_norm_r, 3); \
+            graph->record_param((void*) &rms_norm_kernel<_res, __tx, __ty, __tw, __tr>, GP_end, 0);    \
+        }                                                                           \
+    }
 
     //      x_type________ w_type_____________  y_type_______        mode      r_type
          __(kHalf,  half,  kHalf,     half,     kHalf,  half,  RES_NONE, kHalf,  half)
@@ -424,7 +434,7 @@ void rms_norm_impl
     else __(kFloat, float, kBFloat16, bfloat16, kHalf,  half,  RES_IN,   kHalf,  half)
     else __(kFloat, float, kBFloat16, bfloat16, kHalf,  half,  RES_IN,   kFloat, float)
 
-    else TORCH_CHECK(false, "rms_norm: Invalid datatypes for input/output");
+    else TORCH_CHECK(false, "rms_norm: Invalid datatypes for input/output: x=", x.scalar_type(), " w=", tw, " y=", y.scalar_type(), " res_mode=", res_mode, " r=", tr);
     #undef __
 
     cuda_check(cudaPeekAtLastError());
@@ -493,6 +503,21 @@ void rms_norm_res_in
 )
 {
     rms_norm_impl(x, w, y, r, epsilon, constant_bias, constant_scale, false, RES_IN);
+}
+
+void rms_norm_res_in_gr
+(
+    at::Tensor x,
+    c10::optional<at::Tensor> w,
+    at::Tensor y,
+    at::Tensor r,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    Graph* graph
+)
+{
+    rms_norm_impl(x, w, y, r, epsilon, constant_bias, constant_scale, false, RES_IN, graph, 1, true);
 }
 
 

@@ -318,11 +318,22 @@ class Model_LSMixin(ABC):
         return None
 
 
+    def _link_next_norms(self):
+        # decode norm fusion: give each TransformerBlock a handle to the following block's attn_norm
+        mods = [m for m, _, _ in self.fwd_modules]
+        for a, b in zip(mods, mods[1:]):
+            if hasattr(a, "next_attn_norm") and hasattr(b, "attn_norm") and getattr(b, "attn", None) is not None and getattr(b, "attn_hc", None) is None:
+                a.next_attn_norm = b.attn_norm
+        self._next_norms_linked = True
+
     def forward_ls(
         self,
         x: torch.Tensor,
         params: dict,
     ):
+        if not getattr(self, "_next_norms_linked", False):
+            self._link_next_norms()
+        params.pop("pre_normed_input", None)
         for h in getattr(self.config, "moe_cpu_hosts", {}).values():
             h.begin_pass()
         for module, instance, idx in self.fwd_modules:

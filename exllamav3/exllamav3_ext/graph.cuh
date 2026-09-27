@@ -25,6 +25,9 @@ enum GraphedParams
     GP_gemm_A_had,
     GP_gemm_B_svh,
     GP_gemm2_C1,      // ROCm dual GEMM: second output
+    GP_norm_x,        // rms_norm_res_in_gr: x (sublayer output), y (normed), r (residual, in/out)
+    GP_norm_y,
+    GP_norm_r,
 
     GP_mgemm,
     GP_mgemm_A,

@@ -8,6 +8,7 @@
 #include "../quant/exl3_gemm.cuh"
 #include "../activation.cuh"
 #include "../add.cuh"
+#include "../norm.cuh"
 
 using namespace torch::indexing;
 
@@ -16,7 +17,11 @@ void BC_GatedMLP::run_bszN_gr
     const at::Tensor& x,
     at::Tensor& d,
     int num_tokens,
-    Graph* graph
+    Graph* graph,
+    const c10::optional<at::Tensor>& residual,
+    const c10::optional<at::Tensor>& norm_w,
+    const c10::optional<at::Tensor>& norm_out,
+    float norm_eps, float norm_bias, float norm_scale
 )
 {
     // guh/gu hold 2 slots (gate, up); slicing the static (2, MAX_BSZN, width) buffers along dim 1
@@ -104,6 +109,90 @@ void BC_GatedMLP::run_bszN_gr
     exl3_gemm_gr(a_n, down->trellis, d, down->suh, down_xh_n, down->svh, -1, down->mcg, down->mul1, 0, graph);
     if (down->bias)
         add_gr(d, down->bias.value(), d, graph);
+    if (residual)
+    {
+        at::Tensor r = residual.value();
+        if (norm_out)
+        {
+            // residual += d and norm_out = rmsnorm(residual) in one kernel (RES_IN)
+            at::Tensor y = norm_out.value();
+            rms_norm_res_in_gr(d, norm_w, y, r, norm_eps, norm_bias, norm_scale, graph);
+        }
+        else
+            add_gr(r, d, r, graph);
+    }
+}
+
+void BC_GatedMLP::run_bszN_resid
+(
+    const at::Tensor& x,
+    at::Tensor& d,
+    at::Tensor& residual,
+    const c10::optional<at::Tensor>& norm_w,
+    const c10::optional<at::Tensor>& norm_out,
+    float norm_eps, float norm_bias, float norm_scale
+)
+{
+    int num_tokens = x.size(1);
+    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MAX_BSZN, "run_bszN_resid: bsz out of supported range");
+    TORCH_CHECK(residual.numel() == d.numel() && residual.is_contiguous(), "run_bszN_resid: residual shape");
+    int graphidx = num_tokens - 1;
+    c10::cuda::CUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    Graph& g = graph_bszN_resid[graphidx];
+    if (g.disabled || (!g.ready && !g.ready_to_record))
+    {
+        run_bszN_gr(x, d, num_tokens, nullptr, residual, norm_w, norm_out, norm_eps, norm_bias, norm_scale);
+        g.ready_to_record = true;
+        return;
+    }
+    if (!g.ready)
+    {
+        g.capture_begin();
+        run_bszN_gr(x, d, num_tokens, &g, residual, norm_w, norm_out, norm_eps, norm_bias, norm_scale);
+        g.capture_end();
+    }
+    std::vector<PPTR> args;
+    if (gu_ptrs_trellis)
+        args.emplace_back(GP_mgemm_A, (void*) x.data_ptr());
+    else
+    {
+        at::Tensor gu_n = gu_cache[num_tokens - 1];
+#if defined(USE_ROCM)
+        if (dual_recorded[graphidx])
+        {
+            args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+            args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 0).data_ptr());
+            args.emplace_back(GP_gemm2_C1, (void*) gu_n.select(0, 1).data_ptr());
+        }
+        else
+#endif
+        {
+            args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+            args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 0).data_ptr());
+            args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+            args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 1).data_ptr());
+        }
+    }
+    args.emplace_back(GP_gemm_C, (void*) d.data_ptr());
+    if (down->bias)
+    {
+        args.emplace_back(GP_add_x, (void*) d.data_ptr());
+        args.emplace_back(GP_add_z, (void*) d.data_ptr());
+    }
+    if (norm_out)
+    {
+        args.emplace_back(GP_norm_x, (void*) d.data_ptr());
+        args.emplace_back(GP_norm_y, (void*) norm_out.value().data_ptr());
+        args.emplace_back(GP_norm_r, (void*) residual.data_ptr());
+    }
+    else
+    {
+        args.emplace_back(GP_add_x, (void*) residual.data_ptr());
+        args.emplace_back(GP_add_y, (void*) d.data_ptr());
+        args.emplace_back(GP_add_z, (void*) residual.data_ptr());
+    }
+    g.launch(args, stream);
 }
 
 void BC_GatedMLP::run_bszN

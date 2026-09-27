@@ -703,6 +703,9 @@ class GatedMLP(Module):
                 self.multi_gu[i] = None
 
 
+    def mlp_resid_scalar_none(self):
+        return True   # the block only requests the fused residual when no resid scalar / post norm applies
+
     @override
     def pin_linears(self):
         # As MLP.pin_linears, plus the fused gate/up MultiLinear: its pointer table holds raw
@@ -741,7 +744,24 @@ class GatedMLP(Module):
                 if self.bc is not None and bsz * q_len <= MAX_BSZN:
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
-                    self.bc.run_bszN(xv, d.view(xv.shape))
+                    resid = params.get("fuse_residual_into_mlp")
+                    if (
+                        resid is not None and self.num_slices == 1 and not self.tp_reduce and
+                        self.mlp_resid_scalar_none() and resid.dtype == d.dtype and
+                        resid.is_contiguous() and resid.numel() == d.numel()
+                    ):
+                        # residual += d recorded inside the MLP graph (saves one host launch + gap);
+                        # optionally the next block's input RMSNorm in the same kernel
+                        nn_ = params.get("fuse_next_norm")
+                        if nn_ is not None:
+                            no = torch.empty_like(xv, dtype = torch.half)
+                            self.bc.run_bszN_resid(xv, d.view(xv.shape), resid.view(xv.shape), nn_.weight, no, nn_.rms_norm_eps, nn_.constant_bias, nn_.constant_scale)
+                            params["fused_norm_out"] = no.view(x.shape)
+                        else:
+                            self.bc.run_bszN_resid(xv, d.view(xv.shape), resid.view(xv.shape))
+                        params["fused_residual_done"] = True
+                    else:
+                        self.bc.run_bszN(xv, d.view(xv.shape))
 
                 elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)

@@ -1061,6 +1061,17 @@ class GatedDeltaNet(Module):
                 else:
                     self._bc_configure_slot(bsz, seqlen, save_history)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
+            fr = params.get("fuse_residual_norm")   # (residual, RMSNorm): residual += y; normed = norm(residual) in-graph
+            if (
+                fr is not None and not self.tp_reduce and out_dtype in (None, self.out_dtype) and
+                fr[0].dtype == y.dtype and fr[0].is_contiguous() and fr[0].numel() == y.numel()
+            ):
+                resid, nm = fr
+                normed = torch.empty_like(x, dtype = torch.half)
+                self.bc.run_bszN_resid(x, y, conv_state, recurrent_state, recurrent_slots, save_history,
+                                       resid, nm.weight, normed, nm.rms_norm_eps, nm.constant_bias, nm.constant_scale)
+                params["fused_residual_norm_out"] = normed
+                return y
             self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
             if self.tp_reduce:
                 self.tp_collect(params["backend"], y)

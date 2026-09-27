@@ -7,6 +7,9 @@ from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, ML
 from .hyperconnections import HyperConnection
 from ..util import profile_opt
 
+import os as _os
+_NO_NORM_FUSE = _os.environ.get("EXL3_NO_NORM_FUSE") is not None
+
 class TransformerBlock(Module):
 
     def __init__(
@@ -33,6 +36,7 @@ class TransformerBlock(Module):
 
         self.layer_idx = layer_idx
         self.attn_norm = attn_norm
+        self.next_attn_norm = None   # set by the model after construction: the following block's attn_norm (decode norm fusion)
         self.attn = attn
         self.attn_post_norm = attn_post_norm
         self.mlp_norm = mlp_norm
@@ -145,6 +149,13 @@ class TransformerBlock(Module):
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
+        fused_norm_out = None
+
+        # Decode fast path: the previous block's fused MLP epilogue may already have produced
+        # attn_norm(x) for this block (see next_attn_norm below)
+        pre_normed = params.pop("pre_normed_input", None)
+        if pre_normed is not None and pre_normed[0] is not self.attn_norm:
+            pre_normed = None
 
         if self.attn:
             if self.attn_hc:
@@ -152,16 +163,37 @@ class TransformerBlock(Module):
                 y = y.half()
                 if self.attn_norm:
                     y = self.attn_norm.forward(y, params, out_dtype = torch.half)
+            elif pre_normed is not None:
+                y = pre_normed[1]
             elif self.attn_norm:
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
+            # attn/GDN sublayer may fuse `x += y; mlp_norm(x)` into its own graph (C++ BC path)
+            mn = self.mlp_norm
+            fuse_rn = (
+                not _NO_NORM_FUSE and self.attn_resid_scalar is None and not self.attn_hc and not self.attn_post_norm and
+                self.mlp is not None and not self.mlp_hc and mn is not None and
+                type(mn).__name__ == "RMSNorm" and not mn.unweighted and mn.groups == 1 and not mn.span_heads and
+                mn.weight is not None and x.is_contiguous()
+            )
+            if fuse_rn:
+                params["fuse_residual_norm"] = (x, mn)
+                params.pop("fused_residual_norm_out", None)
             y = self.attn.forward(y, params)
+            fused_norm_out = None
+            if fuse_rn:
+                params.pop("fuse_residual_norm", None)
+                fused_norm_out = params.pop("fused_residual_norm_out", None)
             if params.get("prefill") and not export_state:
                 return x
-            if self.attn_resid_scalar is not None:
+            if fused_norm_out is not None:
+                pass   # x already holds x + y; fused_norm_out = mlp_norm(x)
+            elif self.attn_resid_scalar is not None:
                 y *= self.attn_resid_scalar
-            if self.attn_hc:
+            if fused_norm_out is not None:
+                pass
+            elif self.attn_hc:
                 x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.attn_post_norm:
                 self.attn_post_norm.forward(y, params, residual = x)
@@ -178,20 +210,41 @@ class TransformerBlock(Module):
                     y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
             else:
                 params["residual"] = x
-                if y_resid is not None:
+                if fused_norm_out is not None:
+                    y = fused_norm_out
+                elif y_resid is not None:
                     y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
                 elif self.mlp_norm:
                     y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
                 else:
                     y = x.half()
+            plain_resid = (
+                self.mlp_resid_scalar is None and not self.mlp_hc and not self.mlp_post_norm and
+                x.dtype == self.mlp.out_dtype and x.is_contiguous()
+            )
+            if plain_resid:
+                params["fuse_residual_into_mlp"] = x
+                params.pop("fused_residual_done", None)
+                # also fold the NEXT block's input norm into the same epilogue kernel (r += d; norm(r))
+                nn_ = self.next_attn_norm if not _NO_NORM_FUSE else None
+                if nn_ is not None and type(nn_).__name__ == "RMSNorm" and not nn_.unweighted and nn_.groups == 1 and not nn_.span_heads and nn_.weight is not None and nn_.weight.dtype in (torch.half, torch.bfloat16):
+                    params["fuse_next_norm"] = nn_
             y = self.mlp.forward(y, params)
-            if self.mlp_resid_scalar is not None:
+            if plain_resid:
+                params.pop("fuse_residual_into_mlp", None)
+                params.pop("fuse_next_norm", None)
+                if params.pop("fused_residual_done", False):
+                    y = None   # already added into x by the MLP graph
+                    pn = params.pop("fused_norm_out", None)
+                    if pn is not None:
+                        params["pre_normed_input"] = (self.next_attn_norm, pn)
+            if y is not None and self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
             if self.mlp_hc:
                 x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)
-            else:
+            elif y is not None:
                 x += y
 
         if export_state:
