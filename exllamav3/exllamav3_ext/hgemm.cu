@@ -2,6 +2,7 @@
 #include "hgemm.cuh"
 #include <c10/cuda/CUDAGuard.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <torch/extension.h>
 #include "util.h"
 #include "util.cuh"
 #include "quant/exl3_devctx.cuh"
@@ -61,6 +62,35 @@ static void hgemm_gemmex_impl
 
     float alpha_ = 1.0f;
     float beta_ = 0.0f;
+#if defined(USE_ROCM)
+    // hipBLAS picks a non-MFMA "HSS" kernel for fp16 x fp16 -> fp32 (14 TFLOPS vs 86 for fp16 out on
+    // gfx1100). Compute in fp16 (fp32 accumulation inside the kernel) and widen; the widening is a
+    // memory-bound elementwise pass, far cheaper than the 6x slower GEMM. The fp16 intermediate
+    // rounds the output to 11 bits - acceptable for the reconstruct-GEMM prefill path (the decode
+    // path never comes here). EXL3_ROCM_HGEMM_FP32=1 restores the direct fp32 output
+    static const bool direct_fp32 = getenv("EXL3_ROCM_HGEMM_FP32") != nullptr;
+    if (output_fp32 && !direct_fp32)
+    {
+        at::Tensor c16 = at::empty({size_m, size_n}, a.options());
+        auto r = cublasGemmEx
+        (
+            cublas_handle,
+            CUBLAS_OP_N, CUBLAS_OP_N,
+            size_n, size_m, size_k,
+            &alpha_, b_ptr, CUDA_R_16F, size_n,
+                     a_ptr, CUDA_R_16F, size_k,
+            &beta_,  c16.data_ptr(), CUDA_R_16F, size_n,
+            CUBLAS_COMPUTE_32F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP
+        );
+        cublas_check(r);
+        // c as a [size_m, size_n] view with its own row stride (c may be a column slice)
+        at::Tensor c2 = torch::from_blob(c.data_ptr(), {size_m, size_n}, {c_stride_m, 1}, c.options());
+        c2.copy_(c16);
+        cuda_check(cudaPeekAtLastError());
+        return;
+    }
+#endif
     cudaDataType_t c_type = output_fp32 ? CUDA_R_32F : CUDA_R_16F;
     auto r = cublasGemmEx
     (

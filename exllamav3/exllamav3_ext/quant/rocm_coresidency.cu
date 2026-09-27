@@ -20,6 +20,8 @@
 #include "../util.cuh"
 #include "rocm_coresidency.cuh"
 #include <map>
+#include <string>
+#include <cstdlib>
 #include <mutex>
 #include <tuple>
 #include <cstdio>
@@ -93,6 +95,40 @@ void init_probes()
 
 }  // namespace
 
+// The measurement depends only on (VGPR allocation, block size, LDS, device name): cache it in
+// memory by those AND on disk, so a process pays each distinct footprint once and later processes
+// pay nothing (the probe costs ~0.2 s per footprint: the failing try spins to its timeout)
+static std::map<std::tuple<std::string, int, int, int>, int> g_fp_cache;
+static bool g_fp_loaded = false;
+static std::string fp_cache_path()
+{
+    const char* home = getenv("HOME");
+    if (!home) return {};
+    return std::string(home) + "/.cache/exllamav3/autotune/rocm_coresidency_v1.txt";
+}
+static void fp_cache_load()
+{
+    if (g_fp_loaded) return;
+    g_fp_loaded = true;
+    FILE* f = fopen(fp_cache_path().c_str(), "r");
+    if (!f) return;
+    char name[256]; int a, b, c, v;
+    while (fscanf(f, "%255s %d %d %d %d", name, &a, &b, &c, &v) == 5) g_fp_cache[std::make_tuple(std::string(name), a, b, c)] = v;
+    fclose(f);
+}
+static void fp_cache_store(const std::string& name, int a, int b, int c, int v)
+{
+    std::string path = fp_cache_path();
+    if (path.empty()) return;
+    std::string dir = path.substr(0, path.rfind('/'));
+    std::string cmd = "mkdir -p '" + dir + "'";
+    if (system(cmd.c_str()) != 0) return;
+    FILE* f = fopen(path.c_str(), "a");
+    if (!f) return;
+    fprintf(f, "%s %d %d %d %d\n", name.c_str(), a, b, c, v);
+    fclose(f);
+}
+
 int rocm_coresident_blocks_per_cu(const void* kernel, int block_dim, int dyn_smem)
 {
     int device = 0;
@@ -108,6 +144,20 @@ int rocm_coresident_blocks_per_cu(const void* kernel, int block_dim, int dyn_sme
     cuda_check(cudaFuncGetAttributes(&fa, kernel));
     const int target_regs = fa.numRegs;
     const int target_lds = (int) fa.sharedSizeBytes + dyn_smem;
+
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, device);
+    std::string dev_name = prop.gcnArchName;
+    for (char& ch : dev_name) if (ch == ' ') ch = '_';
+    const int target_alloc_key = (target_regs + 7) / 8 * 8;
+    fp_cache_load();
+    auto fkey = std::make_tuple(dev_name, target_alloc_key, block_dim, target_lds);
+    auto fit = g_fp_cache.find(fkey);
+    if (fit != g_fp_cache.end())
+    {
+        g_cache[key] = fit->second;
+        return fit->second;
+    }
 
     // smallest probe whose VGPR ALLOCATION (8-register granularity on gfx11) is >= the target's
     const void* probe = nullptr;
@@ -158,7 +208,7 @@ int rocm_coresident_blocks_per_cu(const void* kernel, int block_dim, int dyn_sme
         cuda_check(cudaMemsetAsync(flags, 0, 8192 * sizeof(unsigned), s));
         cuda_check(cudaMemsetAsync(ok, 0, sizeof(unsigned), s));
         void* args[] = { &flags, &N, &ok, &sink, nullptr };
-        unsigned spin_limit = 2000000u;
+        unsigned spin_limit = 300000u;
         args[4] = &spin_limit;
         cudaError_t e = cudaLaunchKernel(probe, dim3(N), dim3(block_dim), args, MAX(target_lds, 1), s);
         if (e != cudaSuccess) { cudaGetLastError(); break; }
@@ -177,6 +227,8 @@ int rocm_coresident_blocks_per_cu(const void* kernel, int block_dim, int dyn_sme
         fprintf(stderr, "[exl3 rocm] coresidency kernel=%p block=%d regs=%d lds=%d: api=%d measured=%d -> using %d blocks/CU\n",
             kernel, block_dim, target_regs, target_lds, api_bps, real, bound);
     g_cache[key] = bound;
+    g_fp_cache[fkey] = bound;
+    fp_cache_store(dev_name, target_alloc_key, block_dim, target_lds, bound);
     return bound;
 }
 

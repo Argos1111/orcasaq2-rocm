@@ -159,6 +159,7 @@ class Qwen3_5Config(Qwen3_5VLBaseConfig):
             None,
             Qwen3_5Model,
             None,
+            Qwen3_5MTPModel,   # registered only when mtp_num_hidden_layers > 0 (see the base config)
             **kwargs
         )
 
@@ -287,6 +288,7 @@ class Qwen3_5MoeConfig(Qwen3_5VLMoeBaseConfig):
             None,
             Qwen3_5MoeModel,
             None,
+            Qwen3_5MoeMTPModel,
             **kwargs
         )
 
