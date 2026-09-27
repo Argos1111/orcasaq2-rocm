@@ -36,6 +36,10 @@
 #define EXL3_X_LDS_TILES 256                                 // 4096 k: 8 KB LDS; 128 forced min grids of 100-400 blocks on the 5120-k shapes (measured: 256 +1 tok/s, 384/512 lose occupancy)
 #endif
 #define EXL3_X_LDS_FLOATS (EXL3_X_LDS_TILES * 16 / 2)        // fp16 halves stored as floats/2
+// 1: multi-row lane tier for 2 <= size_m <= 8 (weights decoded once per tile, applied to all rows)
+#ifndef EXL3_ROCM_MROWS
+#define EXL3_ROCM_MROWS 1
+#endif
 // 1: deterministic in-block k-split reduction (slots + ordered sum) instead of LDS atomicAdd
 #ifndef EXL3_ROCM_DET_KSPLIT
 #define EXL3_ROCM_DET_KSPLIT 1
@@ -45,7 +49,7 @@
 #define EXL3_ROCM_ORDERED_EPILOGUE 1
 #endif
 // k-split slots (EXL3_ROCM_DET_KSPLIT): one 16-float slot per 8-lane group, max 512 threads = 64 groups
-#define EXL3_KSLOT_FLOATS (64 * 16)
+#define EXL3_KSLOT_FLOATS (64 * 16)   // the multi-row tier clamps its k-split so KS * items * MR fits
 #define EXL3_INNER_SH_FLOATS(ts_n) (16 * (ts_n) + (EXL3_ROCM_FUSED_HAD ? EXL3_X_LDS_FLOATS : 0) + ((EXL3_ROCM_DET_KSPLIT || EXL3_ROCM_ORDERED_EPILOGUE) ? EXL3_KSLOT_FLOATS : 0))
 
 // 1: route the 4/6-bit mul1 tensors through the generic k-split lane tier as well
@@ -970,6 +974,224 @@ __device__ __forceinline__ void phase1_lane(SegCtx& c)
 #endif
 }
 
+// Tier B-multi: the lane tier for 2 <= size_m <= EXL3_ROCM_MROWS_MAX rows. One 8-lane group per
+// (subtile, k-split), the decoded tile is applied to MR rows of x (one dot2 per pair per row) so
+// the weights are decoded ONCE instead of once per row. mul1 codebook (cb 2) + paired dot2 only;
+// other codebooks keep the per-row tier. x rows come from the LDS slice or the global A.
+// Registers: + 8 x (MR - 1) for the x buffers, + 2 x (MR - 1) accumulators
+template <int bits, bool half_k, int MR>
+__device__ __forceinline__ void phase1_lane_mrows(SegCtx& c)
+{
+    constexpr int cb = 2;
+    constexpr int SUB_U32 = 8 * bits + (half_k ? 4 : 0);
+    constexpr int LANE_BITS = 32 * bits + (half_k ? 16 : 0);
+    constexpr int NW = half_k ? (LANE_BITS + 16 + 31) / 32 : bits;
+
+    const int lane = threadIdx.x & 7;
+    const int rem = threadIdx.x >> 3;
+    const int groups = blockDim.x >> 3;
+    const int items = c.subs_tile;                 // one item per subtile (all rows together)
+    const int cols = c.subs_tile * 16;
+    const int size_m = c.size_m;                   // <= MR
+    int KS = groups / items;
+    if (KS < 1) KS = 1;
+    const int seg_len = c.kt1 - c.kt0;
+    if (KS > seg_len) KS = seg_len;
+
+    __syncthreads();
+    // per-chain slots: KS * items * MR * 16 floats. groups * MR * 16 <= 64 * 8 * 16 = 8192 floats:
+    // more than the kslot area -> clamp KS so that KS * items * MR * 16 fits EXL3_KSLOT_FLOATS
+    while (KS > 1 && KS * items * MR * 16 > EXL3_KSLOT_FLOATS) KS >>= 1;
+    float* kslots = c.sh_c + 16 * c.subs_tile * 16 + (EXL3_ROCM_FUSED_HAD ? EXL3_X_LDS_FLOATS : 0);
+    if (KS == 1)
+        for (int i = threadIdx.x; i < size_m * cols; i += blockDim.x) c.sh_c[i] = 0.f;
+    __syncthreads();
+
+    const int base_bit = LANE_BITS * lane;
+    const int bw = base_bit >> 5;
+    const bool odd = half_k && ((base_bit & 31) != 0);
+    const int bw_prev = (bw == 0) ? (SUB_U32 - 1) : (bw - 1);
+    const int seg_k = (c.kt1 - c.kt0) * 16;
+    const int x_t0 = c.xl ? c.kt0 : 0;
+    const size_t x_row_stride = c.xl ? (size_t) seg_k : (size_t) c.size_k;
+    const half* x_base = c.xl ? c.xl : c.A;
+
+    for (int idx = rem; idx < items * KS; idx += groups)
+    {
+        const int ks = idx / items;
+        const int s_ = idx - ks * items;
+        const int n = c.col * c.subs_tile + s_;
+        const int t0 = c.kt0 + (int) ((int64_t) seg_len * ks / KS);
+        const int t1 = c.kt0 + (int) ((int64_t) seg_len * (ks + 1) / KS);
+        const uint32_t* base =
+            (const uint32_t*) c.B + (size_t) c.kt0 * (c.nsub_total * SUB_U32) + (size_t) n * SUB_U32;
+
+        float acc0[MR], acc1[MR], xsum[MR];
+        #pragma unroll
+        for (int r = 0; r < MR; ++r) { acc0[r] = 0.f; acc1[r] = 0.f; xsum[r] = 0.f; }
+        // x buffers dominate the registers (8 x MR words each): MR 2 keeps two (prefetched with the
+        // weights), MR >= 4 keeps one and fetches x just in time (LDS / L2 latency only)
+        constexpr bool XJIT = MR >= 4;
+        uint32_t bufA[NW + 1], bufB[NW + 1];
+        uint32_t xA[MR][8], xB[XJIT ? 1 : MR][8];
+
+        auto load_w = [&](int t, uint32_t* a)
+        {
+            const uint32_t* p32 = base + (size_t) (t - c.kt0) * (c.nsub_total * SUB_U32);
+            if constexpr (half_k)
+            {
+                uint32_t w[NW + 2];
+                w[0] = p32[bw_prev];
+                #pragma unroll
+                for (int k = 0; k < NW; ++k) w[k + 1] = p32[bw + k];
+                w[NW + 1] = 0;
+                #pragma unroll
+                for (int k = 0; k <= NW; ++k) a[k] = odd ? ((w[k] << 16) | (w[k + 1] >> 16)) : w[k];
+            }
+            else
+            {
+                a[0] = p32[bw_prev];
+                #pragma unroll
+                for (int k = 0; k < NW; ++k) a[k + 1] = p32[bw + k];
+            }
+        };
+        auto load_x = [&](int t, uint32_t (*xw)[8])
+        {
+            // rows beyond size_m read row 0 (valid memory; their results are discarded)
+            #pragma unroll
+            for (int r = 0; r < MR; ++r)
+            {
+                const int rr = r < size_m ? r : 0;
+                if (c.xl)
+                {
+                    typedef __attribute__((address_space(3))) const uint32_t lds_u32;
+                    lds_u32* xp = (lds_u32*) (const uint32_t*) (x_base + rr * x_row_stride + (t - x_t0) * 16);
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) xw[r][k] = xp[k];
+                }
+                else
+                {
+                    typedef __attribute__((address_space(1))) const uint4 gl_uint4;
+                    gl_uint4* xp = (gl_uint4*) (const uint4*) (x_base + rr * x_row_stride + t * 16);
+                    uint4 x0, x1;
+                    x0.x = xp[0].x; x0.y = xp[0].y; x0.z = xp[0].z; x0.w = xp[0].w;
+                    x1.x = xp[1].x; x1.y = xp[1].y; x1.z = xp[1].z; x1.w = xp[1].w;
+                    xw[r][0] = x0.x; xw[r][1] = x0.y; xw[r][2] = x0.z; xw[r][3] = x0.w;
+                    xw[r][4] = x1.x; xw[r][5] = x1.y; xw[r][6] = x1.z; xw[r][7] = x1.w;
+                }
+            }
+        };
+
+        auto decode_tile = [&](const uint32_t* a, uint32_t (*xw)[8])
+        {
+            float b0[MR], b1[MR];
+            #pragma unroll
+            for (int r = 0; r < MR; ++r) { b0[r] = 0.f; b1[r] = 0.f; }
+            #pragma unroll
+            for (int i0 = 0; i0 < 32; i0 += EXL3_ROCM_ILV)
+            {
+                uint32_t code[EXL3_ROCM_ILV], t[EXL3_ROCM_ILV];
+                #pragma unroll
+                for (int j = 0; j < EXL3_ROCM_ILV; ++j)
+                {
+                    const int E = lane_e_rel<bits, half_k>(i0 + j);
+                    const int p = (E - 1) >> 5;
+                    const int sh = 32 * (p + 1) - E;
+                    code[j] = __funnelshift_r(a[p + 1], a[p], sh);
+                }
+                #pragma unroll
+                for (int j = 0; j < EXL3_ROCM_ILV; ++j) asm volatile("v_mad_u32_u16 %0, %1, %2, 0" : "=v"(t[j]) : "v"(code[j]), "s"(0xD12Du));
+                #pragma unroll
+                for (int j = 0; j < EXL3_ROCM_ILV; ++j) asm volatile("v_mad_u16 %0, %1, %2, %0 op_sel:[0,0,1,1]" : "+v"(t[j]) : "v"(code[j]), "s"(0x83DCu));
+                uint32_t pk[EXL3_ROCM_ILV / 2];
+                #pragma unroll
+                for (int j = 0; j < EXL3_ROCM_ILV; j += 2) asm volatile("v_sad_u8 %0, %0, 0, 0x64006400" : "+v"(t[j]));
+                #pragma unroll
+                for (int j = 0; j < EXL3_ROCM_ILV; j += 2) asm volatile("v_sad_hi_u8 %0, %1, 0, %2" : "=v"(pk[j / 2]) : "v"(t[j + 1]), "v"(t[j]));
+                // the decoded pair goes to every row: MR independent dot2 chains per pair
+                #pragma unroll
+                for (int j = 0; j < EXL3_ROCM_ILV; j += 2)
+                {
+                    const int i = i0 + j;
+                    const int g = i >> 3, k = i & 7;
+                    const int rr = 2 * g + 8 * ((k >> 1) & 1);
+                    #pragma unroll
+                    for (int r = 0; r < MR; ++r)
+                    {
+                        float* acc = (k < 4) ? ((k & 2) ? &b0[r] : &acc0[r]) : ((k & 2) ? &b1[r] : &acc1[r]);
+                        asm volatile("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(*acc) : "v"(pk[j / 2]), "v"(xw[r][rr / 2]));
+                    }
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < MR; ++r)
+            {
+                acc0[r] += b0[r]; acc1[r] += b1[r];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) asm volatile("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(xsum[r]) : "v"(xw[r][i]), "s"(0x3c003c00u));
+            }
+        };
+
+        const int ntiles = t1 - t0;
+        if constexpr (XJIT)
+        {
+            if (ntiles > 0) load_w(t0, bufA);
+            for (int i = 0; i < ntiles; i += 2)
+            {
+                const bool has_b = (i + 1 < ntiles);
+                if (has_b) load_w(t0 + i + 1, bufB);
+                load_x(t0 + i, xA);
+                decode_tile(bufA, xA);
+                if (i + 2 < ntiles) load_w(t0 + i + 2, bufA);
+                if (has_b) { load_x(t0 + i + 1, xA); decode_tile(bufB, xA); }
+            }
+        }
+        else
+        {
+            if (ntiles > 0) { load_w(t0, bufA); load_x(t0, xA); }
+            for (int i = 0; i < ntiles; i += 2)
+            {
+                const bool has_b = (i + 1 < ntiles);
+                if (has_b) { load_w(t0 + i + 1, bufB); load_x(t0 + i + 1, xB); }
+                decode_tile(bufA, xA);
+                if (i + 2 < ntiles) { load_w(t0 + i + 2, bufA); load_x(t0 + i + 2, xA); }
+                if (has_b) decode_tile(bufB, xB);
+            }
+        }
+
+        const float k_inv = __half2float(__ushort_as_half((unsigned short) MUL1_K_INV_BITS));
+        const float k_bias = __half2float(__ushort_as_half((unsigned short) MUL1_K_BIAS_BITS));
+        #pragma unroll
+        for (int r = 0; r < MR; ++r)
+        {
+            if (r >= size_m) break;
+            const float o0 = k_inv * acc0[r] + k_bias * xsum[r];
+            const float o1 = k_inv * acc1[r] + k_bias * xsum[r];
+            if (KS == 1)
+            {
+                float* out = c.sh_c + (size_t) r * cols + (size_t) s_ * 16;
+                out[lane] = o0; out[lane + 8] = o1;
+            }
+            else
+            {
+                float* slot = kslots + ((size_t) idx * MR + r) * 16;
+                slot[lane] = o0; slot[lane + 8] = o1;
+            }
+        }
+    }
+    if (KS > 1)
+    {
+        __syncthreads();
+        for (int i = threadIdx.x; i < items * size_m * 16; i += blockDim.x)
+        {
+            const int e = i & 15, ri = i >> 4, r = ri % size_m, item = ri / size_m;
+            float s = 0.f;
+            for (int ks = 0; ks < KS; ++ks) s += kslots[((size_t) (ks * items + item) * MR + r) * 16 + e];
+            c.sh_c[(size_t) r * cols + (size_t) item * 16 + e] = s;
+        }
+    }
+}
+
 // Tier C: everything else. One warp per subtile through dq_dispatch
 
 template <int bits, int cb, bool half_k = false>
@@ -1066,7 +1288,8 @@ __host__ __device__ __forceinline__ bool rocm_ordered_fits(int num_slices, int t
 
 // lane_only: decode instance (size_m <= LANE_TIER_MAX_M guaranteed by the host); leaving the warp/dq
 // tier out of the kernel saves ~14 VGPRs (113 -> 99 at 3bpw), i.e. 3 -> 4 blocks/CU at 512 threads
-template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool dual = false, bool lane_only = false>
+// MR: 0 = single-row lane tier (or the general tiers), 2/4/8 = multi-row lane tier instance
+template<EXL3_GEMM_T_ARGS, bool shmem_out_had, bool dual = false, bool lane_only = false, int MR = 0>
 __device__ void exl3_gemm_kernel_inner
 (
     const half* __restrict__  A,
@@ -1243,7 +1466,9 @@ __device__ void exl3_gemm_kernel_inner
         }
         else if constexpr (bits > 0)
         {
-            if constexpr (lane_only)
+            if constexpr (MR > 0 && cb == 2)
+                phase1_lane_mrows<bits, half_k, MR>(c);       // multi-row decode instance (host: 2 <= size_m <= MR)
+            else if constexpr (lane_only)
                 phase1_lane<bits, half_k, cb>(c);
             else if (c.size_m <= LANE_TIER_MAX_M)
                 phase1_lane<bits, half_k, cb>(c);

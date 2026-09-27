@@ -130,6 +130,22 @@ static inline int rocm_gemm_blocks_per_cu(const void* kernel, int block_dim, int
 }
 #endif
 
+#if defined(USE_ROCM)
+// body kernel for a decode-shaped call: 1 row -> lane-only decode kernel; 2..8 rows with the mul1
+// codebook -> multi-row instance (weights decoded once); otherwise the general body
+static inline fp_exl3_gemm_kernel rocm_pick_body_kernel(int K, int si, bool c_fp32, int cb, bool half_k, int size_m)
+{
+    static const bool no_mrows = getenv("EXL3_ROCM_NO_MROWS") != nullptr;
+    if (size_m >= 2 && size_m <= 8 && cb == 2 && !no_mrows)
+    {
+        fp_exl3_gemm_kernel k = get_gemmm_kernel_ptr(K, si, c_fp32, size_m, half_k);
+        if (k) return k;
+    }
+    if (size_m <= 8) return get_gemmd_kernel_ptr(K, si, c_fp32, cb, half_k);
+    return get_gemm_kernel_ptr(K, si, c_fp32, cb, half_k);
+}
+#endif
+
 uint64_t gemm_autotune_hash
 (
     int size_m,
@@ -299,7 +315,7 @@ int exl3_gemm_gr
         for (int si = 1; si <= EXL3_GEMM_NUM_SHAPES; ++si)
         {
             if (!exl3_gemm_shape_compat(si, size_m, size_k, size_n, K) || fused_min_grid[si] < 0) continue;
-            fp_exl3_gemm_kernel kf = size_m <= 8 ? get_gemmd_kernel_ptr(K, si, c_fp32, cb, half_k) : get_gemm_kernel_ptr(K, si, c_fp32, cb, half_k);
+            fp_exl3_gemm_kernel kf = rocm_pick_body_kernel(K, si, c_fp32, cb, half_k, size_m);
             if (!kf) continue;
             int bps = rocm_gemm_blocks_per_cu((const void*) kf, exl3_gemm_blockdim_g[si], GEMM_DYN_SMEM, size_m, size_n, exl3_gemm_tilesize_n_g[si], num_sms);
             int tilesize_k = exl3_gemm_tilesize_k_g[si];
@@ -418,8 +434,7 @@ int exl3_gemm_gr
         {
             if (!exl3_gemm_shape_compat(candidate_shape_idx, size_m, size_k, size_n, K)) continue;
 
-            fp_exl3_gemm_kernel candidate_kernel = size_m <= 8 ? get_gemmd_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k)
-                                                                : get_gemm_kernel_ptr(K, candidate_shape_idx, c_fp32, cb, half_k);
+            fp_exl3_gemm_kernel candidate_kernel = rocm_pick_body_kernel(K, candidate_shape_idx, c_fp32, cb, half_k, size_m);
             if (!candidate_kernel) continue;
 
             int tilesize_k = exl3_gemm_tilesize_k_g[candidate_shape_idx];
@@ -483,7 +498,7 @@ int exl3_gemm_gr
     );
     if (!kernel) return 0;
 #if defined(USE_ROCM)
-    if (size_m <= 8) kernel = get_gemmd_kernel_ptr(K, shape_idx, c_fp32, cb, half_k);
+    kernel = rocm_pick_body_kernel(K, shape_idx, c_fp32, cb, half_k, size_m);
 #endif
 
     // Launch
@@ -568,6 +583,9 @@ int exl3_gemm2_gr
     int size_m = 1;
     for (int d = 0; d < A.dim() - 1; ++d) size_m *= A.size(d);
     TORCH_CHECK(size_m <= 16, "exl3_gemm2: size_m <= 16 only (decode path)");
+    // the dual kernel is the per-row lane tier: for 2+ rows the multi-row single GEMMs (weights
+    // decoded once) are faster than one dual launch decoding per row -> let the caller split
+    if (size_m > 1) return -1;
     int size_k = A.size(-1);
     int size_n = B0.size(1) * 16;
     int size_n1 = B1.size(1) * 16;
@@ -612,7 +630,9 @@ int exl3_gemm2_gr
 
     if (force_shape_idx <= 0 && force_num_sms <= 0)
     {
-        uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k) ^ 0x6E3322ull ^ ((uint64_t) size_n1 * 0x9E3779B97F4A7C15ull);
+        // keyed on the exact size_m: the fused-had minimum grid depends on it, and a record tuned for
+        // 1 row launched with 2 rows would overflow the LDS x slice
+        uint64_t autotune_key = gemm_autotune_hash(size_m + 1000, size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k) ^ 0x6E3322ull ^ ((uint64_t) size_n1 * 0x9E3779B97F4A7C15ull);
         CoopAutotuneLaunch tuned;
         if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, GEMM_DYN_SMEM, stream, &tuned))
         {

@@ -106,11 +106,13 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_gemm2_body_kernel<_bits, _half_k, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
     exl3_gemm2_body_kernel<_bits, _half_k, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
 #define EXL3_GEMM2_INSTANCES_H(K) \
+    EXL3_GEMMM_TABLES(h##K, K, true) \
     fp_exl3_gemm2_kernel tfp_exl3_gemm2_kernel_fp16_h##K[] = { EXL3_GEMM2_KERNEL_INSTANCES(K, true, false, 2) }; \
     fp_exl3_gemm2_kernel tfp_exl3_gemm2_kernel_fp32_h##K[] = { EXL3_GEMM2_KERNEL_INSTANCES(K, true, true, 2) }; \
     fp_exl3_gemm_kernel tfp_exl3_gemmd_kernel_fp16_h##K[] = { EXL3_GEMMD_KERNEL_INSTANCES(K, true, false, 2) }; \
     fp_exl3_gemm_kernel tfp_exl3_gemmd_kernel_fp32_h##K[] = { EXL3_GEMMD_KERNEL_INSTANCES(K, true, true, 2) };
 #define EXL3_GEMM2_EXTERNS_H(K) \
+    EXL3_GEMMM_EXTERNS(h##K) \
     extern fp_exl3_gemm2_kernel tfp_exl3_gemm2_kernel_fp16_h##K[]; \
     extern fp_exl3_gemm2_kernel tfp_exl3_gemm2_kernel_fp32_h##K[]; \
     extern fp_exl3_gemm_kernel tfp_exl3_gemmd_kernel_fp16_h##K[]; \
@@ -122,13 +124,40 @@ typedef void (*fp_exl3_mgemm_kernel) (EXL3_MGEMM_ARGS);
     exl3_gemm_decode_kernel<_bits, _half_k, _c_fp32, cb, EXL3_GEMM_SHAPE_2>, \
     exl3_gemm_decode_kernel<_bits, _half_k, _c_fp32, cb, EXL3_GEMM_SHAPE_3>, \
     exl3_gemm_decode_kernel<_bits, _half_k, _c_fp32, cb, EXL3_GEMM_SHAPE_4>
+// multi-row decode instances (mul1 only -> cb 2 tables; MR 2 / 4 / 8)
+#define EXL3_GEMMM_KERNEL_INSTANCES(_bits, _half_k, _c_fp32, MR) \
+    nullptr, \
+    exl3_gemm_mrows_kernel<_bits, _half_k, _c_fp32, 2, EXL3_GEMM_SHAPE_1, MR>, \
+    exl3_gemm_mrows_kernel<_bits, _half_k, _c_fp32, 2, EXL3_GEMM_SHAPE_2, MR>, \
+    exl3_gemm_mrows_kernel<_bits, _half_k, _c_fp32, 2, EXL3_GEMM_SHAPE_3, MR>, \
+    exl3_gemm_mrows_kernel<_bits, _half_k, _c_fp32, 2, EXL3_GEMM_SHAPE_4, MR>
+#define EXL3_GEMMM_TABLES(sfx, _bits, _half_k) \
+    fp_exl3_gemm_kernel tfp_exl3_gemmm2_kernel_fp16_##sfx[] = { EXL3_GEMMM_KERNEL_INSTANCES(_bits, _half_k, false, 2) }; \
+    fp_exl3_gemm_kernel tfp_exl3_gemmm4_kernel_fp16_##sfx[] = { EXL3_GEMMM_KERNEL_INSTANCES(_bits, _half_k, false, 4) }; \
+    fp_exl3_gemm_kernel tfp_exl3_gemmm6_kernel_fp16_##sfx[] = { EXL3_GEMMM_KERNEL_INSTANCES(_bits, _half_k, false, 6) }; \
+    fp_exl3_gemm_kernel tfp_exl3_gemmm8_kernel_fp16_##sfx[] = { EXL3_GEMMM_KERNEL_INSTANCES(_bits, _half_k, false, 8) }; \
+    fp_exl3_gemm_kernel tfp_exl3_gemmm2_kernel_fp32_##sfx[] = { EXL3_GEMMM_KERNEL_INSTANCES(_bits, _half_k, true, 2) }; \
+    fp_exl3_gemm_kernel tfp_exl3_gemmm4_kernel_fp32_##sfx[] = { EXL3_GEMMM_KERNEL_INSTANCES(_bits, _half_k, true, 4) }; \
+    fp_exl3_gemm_kernel tfp_exl3_gemmm6_kernel_fp32_##sfx[] = { EXL3_GEMMM_KERNEL_INSTANCES(_bits, _half_k, true, 6) }; \
+    fp_exl3_gemm_kernel tfp_exl3_gemmm8_kernel_fp32_##sfx[] = { EXL3_GEMMM_KERNEL_INSTANCES(_bits, _half_k, true, 8) };
+#define EXL3_GEMMM_EXTERNS(sfx) \
+    extern fp_exl3_gemm_kernel tfp_exl3_gemmm2_kernel_fp16_##sfx[]; extern fp_exl3_gemm_kernel tfp_exl3_gemmm4_kernel_fp16_##sfx[]; extern fp_exl3_gemm_kernel tfp_exl3_gemmm6_kernel_fp16_##sfx[]; extern fp_exl3_gemm_kernel tfp_exl3_gemmm8_kernel_fp16_##sfx[]; \
+    extern fp_exl3_gemm_kernel tfp_exl3_gemmm2_kernel_fp32_##sfx[]; extern fp_exl3_gemm_kernel tfp_exl3_gemmm4_kernel_fp32_##sfx[]; extern fp_exl3_gemm_kernel tfp_exl3_gemmm6_kernel_fp32_##sfx[]; extern fp_exl3_gemm_kernel tfp_exl3_gemmm8_kernel_fp32_##sfx[];
 // integer K: one gemm2 table per (K, cb) alongside the regular ones
+#define EXL3_GEMMM_INSTANCES_CB_2(K) EXL3_GEMMM_TABLES(b##K, K, false)
+#define EXL3_GEMMM_INSTANCES_CB_1(K)
+#define EXL3_GEMMM_INSTANCES_CB_0(K)
 #define EXL3_GEMM2_INSTANCES_CB(K, cb) \
+    EXL3_GEMMM_INSTANCES_CB_##cb(K) \
     fp_exl3_gemm2_kernel tfp_exl3_gemm2_kernel_fp16_b##K##_cb##cb[] = { EXL3_GEMM2_KERNEL_INSTANCES(K, false, false, cb) }; \
     fp_exl3_gemm2_kernel tfp_exl3_gemm2_kernel_fp32_b##K##_cb##cb[] = { EXL3_GEMM2_KERNEL_INSTANCES(K, false, true, cb) }; \
     fp_exl3_gemm_kernel tfp_exl3_gemmd_kernel_fp16_b##K##_cb##cb[] = { EXL3_GEMMD_KERNEL_INSTANCES(K, false, false, cb) }; \
     fp_exl3_gemm_kernel tfp_exl3_gemmd_kernel_fp32_b##K##_cb##cb[] = { EXL3_GEMMD_KERNEL_INSTANCES(K, false, true, cb) };
+#define EXL3_GEMMM_EXTERNS_CB_2(K) EXL3_GEMMM_EXTERNS(b##K)
+#define EXL3_GEMMM_EXTERNS_CB_1(K)
+#define EXL3_GEMMM_EXTERNS_CB_0(K)
 #define EXL3_GEMM2_EXTERNS_CB(K, cb) \
+    EXL3_GEMMM_EXTERNS_CB_##cb(K) \
     extern fp_exl3_gemm2_kernel tfp_exl3_gemm2_kernel_fp16_b##K##_cb##cb[]; \
     extern fp_exl3_gemm2_kernel tfp_exl3_gemm2_kernel_fp32_b##K##_cb##cb[]; \
     extern fp_exl3_gemm_kernel tfp_exl3_gemmd_kernel_fp16_b##K##_cb##cb[]; \
@@ -234,5 +263,6 @@ fp_exl3_gemm_kernel get_gemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int c
 #if defined(USE_ROCM)
 fp_exl3_gemm2_kernel get_gemm2_kernel_ptr(int K, int shape_idx, int cb, bool half_k = false, bool c_fp32 = false);
 fp_exl3_gemm_kernel get_gemmd_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb, bool half_k = false);   // decode (lane-only) body
+fp_exl3_gemm_kernel get_gemmm_kernel_ptr(int K, int shape_idx, bool c_fp32, int mr, bool half_k = false);   // multi-row decode body (mul1; mr 2/4/8), nullptr if none
 #endif
 fp_exl3_mgemm_kernel get_mgemm_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb, bool half_k = false);

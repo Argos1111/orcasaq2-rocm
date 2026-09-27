@@ -79,6 +79,18 @@ void exl3_gemm_decode_kernel(EXL3_GEMM_ARGS)
     (A, B, C, size_m, size_k, size_n, locks, svh, 0, inner_sh, suh, locks);
 }
 
+// Multi-row decode body (2 <= size_m <= MR, mul1 codebook): each weight tile decoded once and
+// applied to all rows. Separate instances per MR so the single-row kernel keeps its 95 VGPRs
+template<EXL3_GEMM_T_ARGS, int MR>
+__global__ __launch_bounds__(EXL3_GEMM_BASE_THREADS * TILESIZE_K / 16) EXL3_ROCM_OCC_ATTR
+void exl3_gemm_mrows_kernel(EXL3_GEMM_ARGS)
+{
+    __shared__ float inner_sh[EXL3_INNER_SH_FLOATS(TILESIZE_N)];
+    exl3_gemm_kernel_inner
+    <bits, half_k, c_fp32, cb, TILESIZE_M, TILESIZE_K, TILESIZE_N, SH_STAGES, FRAG_STAGES, true, false, true, MR>
+    (A, B, C, size_m, size_k, size_n, locks, svh, 0, inner_sh, suh, locks);
+}
+
 // Dual GEMM body (gate/up fusion): two weight matrices of identical (k, n, K) sharing the input
 // (and its fused Hadamard) in one launch: half the launches, and the autotuner sees a 2x wider
 // problem. B1 / C1 / svh1 follow the regular argument list. Single 16-row slab only (decode)

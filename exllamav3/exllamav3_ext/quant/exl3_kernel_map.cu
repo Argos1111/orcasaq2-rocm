@@ -250,6 +250,35 @@ static fp_exl3_gemm_kernel* const tab_gemmd_fp16_h[4] =
 static fp_exl3_gemm_kernel* const tab_gemmd_fp32_h[4] =
     { nullptr, tfp_exl3_gemmd_kernel_fp32_h1, tfp_exl3_gemmd_kernel_fp32_h2, tfp_exl3_gemmd_kernel_fp32_h3 };
 
+#define EXL3_GEMMM_ROW(fp, K) { tfp_exl3_gemmm2_kernel_##fp##_b##K, tfp_exl3_gemmm4_kernel_##fp##_b##K, tfp_exl3_gemmm6_kernel_##fp##_b##K, tfp_exl3_gemmm8_kernel_##fp##_b##K }
+static fp_exl3_gemm_kernel* const tab_gemmm_fp16[9][4] =
+{
+    { nullptr, nullptr, nullptr, nullptr },
+    EXL3_GEMMM_ROW(fp16, 1), EXL3_GEMMM_ROW(fp16, 2), EXL3_GEMMM_ROW(fp16, 3), EXL3_GEMMM_ROW(fp16, 4),
+    EXL3_GEMMM_ROW(fp16, 5), EXL3_GEMMM_ROW(fp16, 6), EXL3_GEMMM_ROW(fp16, 7), EXL3_GEMMM_ROW(fp16, 8)
+};
+static fp_exl3_gemm_kernel* const tab_gemmm_fp32[9][4] =
+{
+    { nullptr, nullptr, nullptr, nullptr },
+    EXL3_GEMMM_ROW(fp32, 1), EXL3_GEMMM_ROW(fp32, 2), EXL3_GEMMM_ROW(fp32, 3), EXL3_GEMMM_ROW(fp32, 4),
+    EXL3_GEMMM_ROW(fp32, 5), EXL3_GEMMM_ROW(fp32, 6), EXL3_GEMMM_ROW(fp32, 7), EXL3_GEMMM_ROW(fp32, 8)
+};
+#define EXL3_GEMMM_ROW_H(fp, K) { tfp_exl3_gemmm2_kernel_##fp##_h##K, tfp_exl3_gemmm4_kernel_##fp##_h##K, tfp_exl3_gemmm6_kernel_##fp##_h##K, tfp_exl3_gemmm8_kernel_##fp##_h##K }
+static fp_exl3_gemm_kernel* const tab_gemmm_fp16_h[4][4] = { { nullptr, nullptr, nullptr, nullptr }, EXL3_GEMMM_ROW_H(fp16, 1), EXL3_GEMMM_ROW_H(fp16, 2), EXL3_GEMMM_ROW_H(fp16, 3) };
+static fp_exl3_gemm_kernel* const tab_gemmm_fp32_h[4][4] = { { nullptr, nullptr, nullptr, nullptr }, EXL3_GEMMM_ROW_H(fp32, 1), EXL3_GEMMM_ROW_H(fp32, 2), EXL3_GEMMM_ROW_H(fp32, 3) };
+
+fp_exl3_gemm_kernel get_gemmm_kernel_ptr(int K, int shape_idx, bool c_fp32, int mr, bool half_k)
+{
+    const int mi = mr <= 2 ? 0 : (mr <= 4 ? 1 : (mr <= 6 ? 2 : 3));
+    if (half_k)
+    {
+        if (K < 1 || K > 3) return nullptr;
+        return (c_fp32 ? tab_gemmm_fp32_h : tab_gemmm_fp16_h)[K][mi][shape_idx];
+    }
+    if (K < 1 || K > 8) return nullptr;
+    return (c_fp32 ? tab_gemmm_fp32 : tab_gemmm_fp16)[K][mi][shape_idx];
+}
+
 fp_exl3_gemm_kernel get_gemmd_kernel_ptr(int K, int shape_idx, bool c_fp32, int cb, bool half_k)
 {
     if (half_k)

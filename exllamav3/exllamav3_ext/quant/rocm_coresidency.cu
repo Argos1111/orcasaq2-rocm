@@ -223,6 +223,19 @@ int rocm_coresident_blocks_per_cu(const void* kernel, int block_dim, int dyn_sme
     // conservative; EXL3_ROCM_CORESIDENCY_MARGIN=n keeps n blocks/CU below it
     static const int margin = getenv("EXL3_ROCM_CORESIDENCY_MARGIN") ? atoi(getenv("EXL3_ROCM_CORESIDENCY_MARGIN")) : 0;
     int bound = MAX(real - margin, 1);
+    // hard architectural cap (wave32 gfx11: 1536 VGPRs per SIMD, 4 SIMDs per CU, 16 waves/SIMD): the
+    // probe ladder cannot represent > 248 live registers, so a 256-register target would otherwise
+    // be measured with a lighter kernel
+    {
+        const int waves_per_block = (block_dim + 31) / 32;
+        const int waves_per_simd = MIN(16, 1536 / MAX(target_alloc, 8));
+        const int cap = MAX(1, (4 * waves_per_simd) / MAX(waves_per_block, 1));
+        if (bound > cap)
+        {
+            if (verbose) fprintf(stderr, "[exl3 rocm] coresidency: measured %d capped to %d by the VGPR budget (%d regs)\n", bound, cap, target_alloc);
+            bound = cap;
+        }
+    }
     if (verbose)
         fprintf(stderr, "[exl3 rocm] coresidency kernel=%p block=%d regs=%d lds=%d: api=%d measured=%d -> using %d blocks/CU\n",
             kernel, block_dim, target_regs, target_lds, api_bps, real, bound);
