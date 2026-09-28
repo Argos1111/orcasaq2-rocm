@@ -1335,7 +1335,10 @@ __device__ void exl3_gemm_kernel_inner
     // piles onto the same channels (measured: identical work per block, duration growing
     // linearly with blockIdx). Stride the slice assignment so co-resident blocks are spread over
     // the whole tile space
-    const int stride = 48;   // ~ CU count; coprime with grid sizes that are not multiples of 48 handled below
+    // stride = CU count, read from the device-info slot of the lock buffer (lock_base is the buffer
+    // base; the multi-slab prefill path passes nullptr and keeps the historical 48)
+    const int devinfo_cus = lock_base ? lock_base[ROCM_DEVINFO_OFFSET] : 0;
+    const int stride = devinfo_cus > 0 ? devinfo_cus : 48;
     int sid = blockIdx.x;
     if (num_slices % stride == 0) sid = (blockIdx.x % stride) * (num_slices / stride) + blockIdx.x / stride;
 #else

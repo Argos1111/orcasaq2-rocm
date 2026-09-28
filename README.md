@@ -254,9 +254,30 @@ uv sync --extra rocm --no-install-project
 uv sync --extra rocm --no-build-isolation
 ```
 
-The default device target is gfx1100 (RX 7900 XTX); all device targets are installed (torch 2.14 requires the full `rocm[device-all]` set), so no changes are needed for another GPU architecture.
+#### Supported AMD GPUs
 
-All kernels except the warp-matrix EXL3 GEMV engines build natively and inference runs through them; the EXL3 conversion flow is untested. Tested on gfx1100 (RX 7900 XTX).
+The EXL3 GEMM kernels in this fork are written for **RDNA3 (gfx11xx) and RDNA4 (gfx12xx)**: they
+decode the trellis weights with wave32 VALU code (inline gfx11/gfx12 asm: `v_mad_u16`, `v_sad_u8`,
+`v_dot2_f32_f16`), bound their grids with a measured co-residency probe, and are tuned for the
+64 KB LDS / 1536 VGPR-per-SIMD budget of those parts.
+
+| status | GPUs | notes |
+|---|---|---|
+| **tested** | RX 7900 XTX (gfx1100), Radeon AI PRO R9700 (gfx1201) | measured numbers in this repo's notes; bit-exact repeatable decode, MTP speculative decoding |
+| expected to work | other RDNA3 / RDNA4 SKUs: 7900 XT / GRE, 7800 XT, 7700, 7600, W7800 / W7900 (gfx1100-1102), 9070 / 9060 (gfx1200/1201), RDNA3.5 APUs (gfx115x, bandwidth-limited) | same ISA family; add the gfx target to `PYTORCH_ROCM_ARCH` and run the first-contact check below. Not measured - please report |
+| not supported | CDNA / Instinct (gfx90a, gfx94x: wave64, would want MFMA kernels), RDNA2 (gfx103x), older | the extension refuses to load (`EXL3_ROCM_ALLOW_ANY_ARCH=1` overrides, at your own risk) |
+
+**First contact with an unmeasured GPU** - build with the debug traps and run the correctness,
+determinism and benchmark scripts under a timeout (a bad kernel then ends the process instead of
+hanging the GPU; without the traps a co-residency miscalculation can freeze the host):
+
+```sh
+HIP_VISIBLE_DEVICES=<n> ./check_device.sh      # in the OrcaSAQ-2-27B workspace; ~10 min
+```
+
+Multiple different AMD GPUs in one machine are fine: autotune and co-residency caches are keyed
+by architecture and CU count. Set `PYTORCH_ROCM_ARCH="gfx1100;gfx1201;..."` before building to
+include every target you own (each adds ~50 s to the build).
 ## Conversion
 
 To convert a model to EXL3 format, use:

@@ -162,3 +162,29 @@ else:
         extra_cuda_cflags = extra_cuda_cflags,
         extra_cflags = extra_cflags
     )
+
+
+# ROCm: the HIP GEMM kernels (lane tier, inline gfx11/gfx12 asm, wave32 co-residency model) are
+# written for RDNA3 / RDNA4. Refuse other architectures up front instead of failing (or hanging)
+# inside a kernel later. EXL3_ROCM_ALLOW_ANY_ARCH=1 bypasses the check for experiments.
+if torch.version.hip:
+    _ROCM_SUPPORTED_PREFIXES = ("gfx110", "gfx115", "gfx120")   # RDNA3 dGPU, RDNA3.5 APU, RDNA4
+    _ROCM_TESTED = {"gfx1100": "RX 7900 XTX", "gfx1201": "Radeon AI PRO R9700"}
+    if not os.environ.get("EXL3_ROCM_ALLOW_ANY_ARCH"):
+        for _i in range(torch.cuda.device_count()):
+            _props = torch.cuda.get_device_properties(_i)
+            _arch = getattr(_props, "gcnArchName", "").split(":", 1)[0]
+            if not _arch.startswith(_ROCM_SUPPORTED_PREFIXES):
+                raise RuntimeError(
+                    f"exllamav3 ROCm fork: device {_i} ({_props.name}, {_arch}) is not supported. "
+                    f"The HIP GEMM kernels target RDNA3 (gfx11xx) and RDNA4 (gfx12xx); tested on "
+                    f"{', '.join(f'{k} ({v})' for k, v in _ROCM_TESTED.items())}. CDNA (gfx9xx, wave64) "
+                    f"and RDNA2 (gfx103x) need different kernels. Set EXL3_ROCM_ALLOW_ANY_ARCH=1 to try anyway "
+                    f"(build with -DEXL3_ROCM_BOUNDS and run dbg_pipe2.py first)."
+                )
+            if _arch not in _ROCM_TESTED and not os.environ.get("EXL3_ROCM_QUIET"):
+                import warnings
+                warnings.warn(
+                    f"exllamav3 ROCm fork: {_props.name} ({_arch}) has not been measured; expected to work "
+                    f"(same ISA family as {list(_ROCM_TESTED)}). Please run dbg_pipe2.py / dbg_det2.py and "
+                    f"report results. Set EXL3_ROCM_QUIET=1 to silence.", stacklevel=1)

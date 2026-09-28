@@ -22,6 +22,9 @@
 #define ROCM_PARTIALS_FLOATS (2 * 1024 * 1024)
 #define ROCM_TICKETS_OFFSET (ROCM_PARTIALS_OFFSET + ROCM_PARTIALS_FLOATS)
 #define ROCM_TICKETS_INTS MAX_TILES_C
+// device-side copy of the CU count (slice permutation stride), written once by DevCtx::get_locks
+#define ROCM_DEVINFO_OFFSET (ROCM_TICKETS_OFFSET + ROCM_TICKETS_INTS)
+#define ROCM_DEVINFO_INTS 16
 
 // Workspace size
 #define WORKSPACE_SIZE (16*1024*1024)

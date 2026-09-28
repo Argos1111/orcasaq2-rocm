@@ -64,7 +64,7 @@ int* DevCtx::get_locks(int device)
     {
         c10::cuda::CUDAGuard guard(device);
         #if defined(USE_ROCM)
-        size_t size = (size_t) (ROCM_TICKETS_OFFSET + ROCM_TICKETS_INTS) * sizeof(int);
+        size_t size = (size_t) (ROCM_DEVINFO_OFFSET + ROCM_DEVINFO_INTS) * sizeof(int);
 #else
         size_t size = (MAX_TILES_C + MAX_BARRIERS * 2 + MOE_SCHED_INTS) * sizeof(int);
 #endif
@@ -72,6 +72,12 @@ int* DevCtx::get_locks(int device)
         TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer allocation failed on device ", device, ": ", cudaGetErrorString(e));
         e = cudaMemset(locks[device], 0, size);
         TORCH_CHECK(e == cudaSuccess, "exl3 lock buffer memset failed: ", cudaGetErrorString(e));
+#if defined(USE_ROCM)
+        // devinfo[0] = CU count: the GEMM inner strides its slice assignment by it (was a 48 constant)
+        int cus = 0;
+        cudaDeviceGetAttribute(&cus, cudaDevAttrMultiProcessorCount, device);
+        cudaMemcpy((int*) locks[device] + ROCM_DEVINFO_OFFSET, &cus, sizeof(int), cudaMemcpyHostToDevice);
+#endif
     }
     return (int*) locks[device];
 }
