@@ -575,7 +575,9 @@ CoopAutotuneLaunch tune
 #endif
 
 #if defined(USE_ROCM)
-        if (base.max_num_sms > 1 && (base.max_num_sms % MAX(base.total_sms, 1)) != 0)
+        // the maximum itself when the CU-multiple sampling did not reach it (and never a grid
+        // below the caller's lower bound: it encodes the LDS x-slice capacity)
+        if (base.max_num_sms > 1 && (base.max_num_sms % MAX(base.total_sms, 1)) != 0 && base.max_num_sms >= min_num_sms)
 #else
         if (base.max_num_sms > 1)
 #endif
@@ -585,6 +587,8 @@ CoopAutotuneLaunch tune
         }
     }
     TORCH_CHECK(!candidates.empty(), "CoopKernelAutotuner: no candidates");
+    static const bool dbg = getenv("EXL3_AUTOTUNE_DEBUG") != nullptr;
+    if (dbg) for (auto& c : candidates) fprintf(stderr, "[autotune] cand tag=%d block=%d grid=%d\n", c.tag, c.block_dim, c.num_sms);
 
     // One buffer for the whole session, freed (back to the Torch pool) when tune() returns
     ThrashBuffer thrash_buf = alloc_thrash_buffer();

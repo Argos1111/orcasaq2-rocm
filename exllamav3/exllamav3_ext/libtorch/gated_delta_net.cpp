@@ -253,13 +253,13 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         // dual GEMM: qkv and z projections in one launch when they share (k, K, codebook) and have
         // no biases (the z GEMM below is then skipped)
         static const bool no_dual = getenv("EXL3_ROCM_NO_GEMM2") != nullptr;
-        qkvz_dual = !no_dual && !kda && z_proj && R <= 16 &&
+        s.qkvz_dual = !no_dual && !kda && z_proj && R <= 16 &&
             qkv_proj->K == z_proj->K && qkv_proj->mcg == z_proj->mcg && qkv_proj->mul1 == z_proj->mul1 &&
             qkv_proj->trellis.size(2) == z_proj->trellis.size(2) && !qkv_proj->bias && !z_proj->bias &&
             s.qkv.dtype() == s.z_flat.dtype() && s.z_flat.is_contiguous();
-        if (qkvz_dual)
-            qkvz_dual = exl3_gemm2_gr(x, qkv_proj->trellis, s.qkv, qkv_proj->svh, qkv_proj->suh, z_proj->trellis, s.z_flat, z_proj->svh, z_proj->suh, qkv_proj->mcg, qkv_proj->mul1, -1, 0, graph) >= 0;
-        if (!qkvz_dual)
+        if (s.qkvz_dual)
+            s.qkvz_dual = exl3_gemm2_gr(x, qkv_proj->trellis, s.qkv, qkv_proj->svh, qkv_proj->suh, z_proj->trellis, s.z_flat, z_proj->svh, z_proj->suh, qkv_proj->mcg, qkv_proj->mul1, -1, 0, graph) >= 0;
+        if (!s.qkvz_dual)
 #endif
         {
         exl3_gemm_gr(x, qkv_proj->trellis, s.qkv, qkv_proj->suh, s.qkv_xh, qkv_proj->svh, -1, qkv_proj->mcg, qkv_proj->mul1, 0, graph);
@@ -288,7 +288,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     }
     else
     {
-        if (!use_qkvz && !qkvz_dual)
+        if (!use_qkvz && !s.qkvz_dual)
         {
             exl3_gemm_gr(x, z_proj->trellis, s.z_flat, z_proj->suh, s.z_xh, z_proj->svh, -1, z_proj->mcg, z_proj->mul1, 0, graph);
             if (z_proj->bias)
@@ -414,7 +414,7 @@ void BC_GatedDeltaNetSplit::run_bszN_resid
         args = { PPTR(GP_mgemm_A, (void*) x.data_ptr()), PPTR(GP_gdn_ba_x, (void*) x.data_ptr()),
                  PPTR(GP_conv1d_state, (void*) conv_state.data_ptr()), PPTR(GP_conv1d_slots, (void*) slots.data_ptr()),
                  PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()), PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()), PPTR(GP_gemm_C, (void*) y.data_ptr()) };
-    else if (qkvz_dual)
+    else if (s.qkvz_dual)
         args = { PPTR(GP_gemm_A, (void*) x.data_ptr()), PPTR(GP_gemm_C, (void*) s.qkv.data_ptr()), PPTR(GP_gemm2_C1, (void*) s.z_flat.data_ptr()), PPTR(GP_gdn_ba_x, (void*) x.data_ptr()),
                  PPTR(GP_conv1d_state, (void*) conv_state.data_ptr()), PPTR(GP_conv1d_slots, (void*) slots.data_ptr()),
                  PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()), PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()), PPTR(GP_gemm_C, (void*) y.data_ptr()) };
@@ -500,7 +500,7 @@ void BC_GatedDeltaNetSplit::run_bszN
             PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
             PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
         };
-    else if (qkvz_dual)
+    else if (s.qkvz_dual)
         args = std::vector<PPTR>
         {
             PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // dual qkv+z input

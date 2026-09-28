@@ -18,7 +18,7 @@
 // [column][slice ordinal][size_m x TS_N] after the MoE scheduler state, then per-column arrival
 // tickets. 8 MB: e.g. 136 columns x 16 slices x 16 x 128... the inner checks the fit per call
 #define ROCM_PARTIALS_OFFSET (MOE_SCHED_OFFSET + MOE_SCHED_INTS + 62)   // 64-int aligned
-#define ROCM_PARTIALS_PER_COL 32
+#define ROCM_PARTIALS_PER_COL 64   // slices per column tile; a 2-column-tile matrix (n=1024, TS_N 512) at grid 64 needs 33
 #define ROCM_PARTIALS_FLOATS (2 * 1024 * 1024)
 #define ROCM_TICKETS_OFFSET (ROCM_PARTIALS_OFFSET + ROCM_PARTIALS_FLOATS)
 #define ROCM_TICKETS_INTS MAX_TILES_C

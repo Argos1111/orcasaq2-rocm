@@ -16,6 +16,7 @@ namespace cg = cooperative_groups;
 #include "coop_autotune.cuh"
 #include "rocm_coresidency.cuh"
 #include <set>
+#include <string>
 #include <vector>
 
 int exl3_gemm_tilesize_k_g[] = {EXL3_GEMM_TILESIZE_K};
@@ -123,7 +124,10 @@ static inline int rocm_gemm_blocks_per_cu(const void* kernel, int block_dim, int
         int over = MAX(oversub, 1);
         while (over > 1 && !rocm_ordered_fits(num_cus * bps * over, size_n / tilesize_n, size_m, tilesize_n)) --over;
         if (over > 1 || rocm_ordered_fits(num_cus * bps, size_n / tilesize_n, size_m, tilesize_n)) bps *= over;
-        // (if even 1x the bound does not fit the ordered buffer, the lock path runs at the bound)
+        // if even 1x the bound does not fit the ordered buffer, shrink the grid until it does: the
+        // lock fallback accumulates through the fp16 output (one rounding per slice), which showed
+        // up as rel_err 0.0006 -> 0.001 on n=1024 tensors at 32 slices per column
+        while (bps > 1 && !rocm_ordered_fits(num_cus * bps, size_n / tilesize_n, size_m, tilesize_n)) --bps;
     }
 #endif
     return MAX(MIN(bps, 12), 1);
@@ -176,6 +180,24 @@ uint64_t gemm_autotune_hash
     mix((uint64_t) cc);
     mix((uint64_t) max_num_sms);
     mix((uint64_t) cb);
+#if defined(USE_ROCM)
+    // The device index is 0 for whichever card HIP_VISIBLE_DEVICES exposes and `cc` is CC_OLD for
+    // every AMD part, so two different GPUs sharing one machine (and one disk cache) collided:
+    // a 7900 XTX record (48 CUs, grid 144) replayed on the R9700 (32 CUs, bound 96) deadlocked.
+    // Key on the architecture name and the CU count as well
+    {
+        static std::string arch[MAX_DEVICES]; static int cus[MAX_DEVICES] = {};
+        const int d = MAX(MIN(device, MAX_DEVICES - 1), 0);
+        if (arch[d].empty())
+        {
+            cudaDeviceProp prop; cudaGetDeviceProperties(&prop, device);
+            arch[d] = prop.gcnArchName; cus[d] = prop.multiProcessorCount;
+        }
+        for (char ch : arch[d]) mix((uint64_t) (unsigned char) ch);
+        mix((uint64_t) cus[d]);
+        mix((uint64_t) size_m + 0x100);   // exact row count (the pow2 rounding above merges 3 with 4 and 5..8)
+    }
+#endif
     return h;
 }
 
@@ -418,7 +440,14 @@ int exl3_gemm_gr
     bool autotune = force_shape_idx <= 0 && force_num_sms <= 0;
     if (autotune)
     {
+#if defined(USE_ROCM)
+        // exact size_m: the kernel instance (1 row / MR 2,4,6,8 / general), the fused-had LDS budget
+        // and the ordered-epilogue capacity all depend on it (a 1-row record replayed at 2 rows
+        // overflowed the LDS x slice on the R9700)
+        uint64_t autotune_key = gemm_autotune_hash(size_m, size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
+#else
         uint64_t autotune_key = gemm_autotune_hash(MAX(size_m, 2), size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k);
+#endif
 #if defined(USE_ROCM)
         if (fused_had) autotune_key ^= 0xF05EDA0Dull;
 #endif
@@ -632,7 +661,7 @@ int exl3_gemm2_gr
     {
         // keyed on the exact size_m: the fused-had minimum grid depends on it, and a record tuned for
         // 1 row launched with 2 rows would overflow the LDS x slice
-        uint64_t autotune_key = gemm_autotune_hash(size_m + 1000, size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k) ^ 0x6E3322ull ^ ((uint64_t) size_n1 * 0x9E3779B97F4A7C15ull);
+        uint64_t autotune_key = gemm_autotune_hash(size_m, size_k, size_n, K, c_fp32, device, cc, num_sms, cb, half_k) ^ 0x6E3322ull ^ ((uint64_t) size_n1 * 0x9E3779B97F4A7C15ull);
         CoopAutotuneLaunch tuned;
         if (CoopKernelAutotuner::launch_locked(autotune_key, kernelArgs, GEMM_DYN_SMEM, stream, &tuned))
         {
