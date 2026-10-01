@@ -17,3 +17,8 @@ exllamav3/exllamav3_ext/**/*_hip.*
 exllamav3/exllamav3_ext/**/*.hip
 exllamav3/exllamav3_ext/**/hip_*.*
 __disk_lru_cache__/
+
+# OrcaSAQ2 runtime layout (README): model checkpoint, loader-patch checkout, venv
+models/
+OrcaSAQ2-kernel/
+.venv/

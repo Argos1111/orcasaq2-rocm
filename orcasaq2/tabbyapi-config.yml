@@ -1,0 +1,50 @@
+# TabbyAPI config for OrcaSAQ2-27B on a 24 GB RDNA3/RDNA4 card (RX 7900 XTX measured).
+# Copy to your TabbyAPI checkout as config.yml; launch with tabbyapi_main.py (see README).
+# 32 GB cards (R9700): raise max_seq_len / cache_size to 196608 and gpu_split to [30].
+
+network:
+  host: 127.0.0.1
+  port: 5000
+  disable_auth: true          # loopback only; set false + api_tokens.yml if you expose it
+  api_servers: ["OAI"]
+
+logging:
+  log_live_status: false
+  log_prompt: false
+  log_generation_params: false
+  log_requests: false
+
+model:
+  model_dir: models
+  model_name: OrcaSAQ2-27B
+  backend: exllamav3
+  # 12.95 GiB weights on a 24 GiB card. 65536 tokens of Q8 KV (16 full-attention layers,
+  # 4 KV heads x 256 dim) is ~2.1 GiB; the 48 GDN layers keep recurrent state per sequence.
+  max_seq_len: 65536
+  cache_size: 65536
+  cache_mode: "8,8"
+  gpu_split_auto: false
+  gpu_split: [22]              # VRAM budget in GiB for the main model
+  chunk_size: 2048
+  max_batch_size: 4
+  # thinking mode: Qwen3.x template emits <think>..</think>; TabbyAPI splits it into `reasoning`
+  reasoning_start_token: "<think>"
+  reasoning_end_token: "</think>"
+  tool_format: auto
+
+draft_model:
+  # "mtp" uses the checkpoint's own MTP head (loaded as a second component, ~1.1 GB weights
+  # + its own cache). Set to "mtp" to try; measured on this card in ../notes.md.
+  # Measured on the RX 7900 XTX with the multi-row decode GEMM (notes.md 2026-09-27 (8)):
+  #   8k:  38.0 -> 51.9 tok/s (draft 3), 32k: 30.8 -> 45.3, 192k: 13.5 -> 21.3
+  draft_mode: mtp
+  draft_num_tokens: 3
+
+sampling:
+  override_preset:
+
+developer:
+  unsafe_launch: false
+  disable_request_streaming: false
+  cuda_malloc_backend: false
+  realtime_process_priority: false
