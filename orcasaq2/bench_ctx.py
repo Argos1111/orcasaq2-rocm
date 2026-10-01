@@ -42,4 +42,4 @@ for ctx in ctxs:
     if accepted is not None: line += f" | accepted draft {accepted}"
     print(line, flush=True); res.append(line)
     print("   ", repr(out[:120]), flush=True)
-print("\n".join(res)); os._exit(0)
+print("\n".join(res)); sys.stdout.flush(); os._exit(0)
