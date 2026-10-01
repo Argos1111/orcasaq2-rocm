@@ -11,8 +11,11 @@ cd "$(dirname "$0")/.."
 PY="${PY:-.venv/bin/python}"   # the project venv (uv sync --extra rocm); plain `uv run` would re-sync to CUDA torch
 rebuild() {  # $1 = extra hipcc flags
   find exllamav3/exllamav3_ext -name "*_hip.*" -o -name "*.hip" | xargs -r rm -f
-  HIPCC_COMPILE_FLAGS_APPEND="${HIPCC_COMPILE_FLAGS_APPEND:-} $1" uv sync --inexact --extra rocm --no-build-isolation --reinstall-package exllamav3 > /tmp/orcasaq2_build.log 2>&1 \
-    || { grep -n "error:" /tmp/orcasaq2_build.log | head -20; return 1; }
+  for attempt in 1 2; do  # the wheel's clang occasionally segfaults in the optimizer on one comp unit; a retry is always clean
+    HIPCC_COMPILE_FLAGS_APPEND="${HIPCC_COMPILE_FLAGS_APPEND:-} $1" uv sync --inexact --extra rocm --no-build-isolation --reinstall-package exllamav3 > /tmp/orcasaq2_build.log 2>&1 && break
+    grep -q "Segmentation fault" /tmp/orcasaq2_build.log && [ $attempt = 1 ] && { echo "   (hipcc crashed, retrying build)"; continue; }
+    grep -n "error:" /tmp/orcasaq2_build.log | head -20; return 1
+  done
   rm -f ~/.cache/exllamav3/autotune/coop_autotune_v1.bin
 }
 echo "== device: $($PY -c "import torch;p=torch.cuda.get_device_properties(0);print(p.name, p.gcnArchName, p.multi_processor_count, 'CUs', round(p.total_memory/2**30,1), 'GiB')")"
