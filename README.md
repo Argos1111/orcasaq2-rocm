@@ -71,14 +71,20 @@ HIP_VISIBLE_DEVICES=0 ./runtime/check_device.sh
 
 ```sh
 git clone https://github.com/theroyallab/tabbyAPI
+uv pip install --python .venv/bin/python "fastapi-slim>=0.115" "pydantic>=2.11,<3" ruamel.yaml rich uvicorn \
+    jinja2 loguru sse-starlette packaging tokenizers numpy aiofiles aiohttp async_lru huggingface_hub \
+    psutil httptools pillow requests uvloop                  # TabbyAPI's deps, into this venv (not its own)
 cp runtime/tabbyapi-config.yml tabbyAPI/config.yml       # Q8 cache, 64k context, MTP draft 3
 cp runtime/tabbyapi_main.py   tabbyAPI/
-ln -s "$PWD/models" tabbyAPI/models
+ln -s "$PWD/models/OrcaSAQ2-27B" tabbyAPI/models/
 cd tabbyAPI && HIP_VISIBLE_DEVICES=0 ORCASAQ2_KERNEL=../OrcaSAQ2-kernel ../.venv/bin/python tabbyapi_main.py
 ```
 
-The API is then at `http://127.0.0.1:5000/v1`. `tabbyapi_main.py` applies the embedding patch and
-hands over to TabbyAPI's `main.py`; use it in place of `main.py`. The config comments explain the
+The API is then at `http://127.0.0.1:5000/v1` (OpenAI-compatible; model id `OrcaSAQ2-27B`).
+`tabbyapi_main.py` is used in place of TabbyAPI's `main.py`: it applies the OrcaSAQ2 embedding
+patch, lets TabbyAPI's exllamav3 backend start on ROCm (upstream TabbyAPI rejects AMD GPUs because
+upstream exllamav3 has no ROCm support), then hands over to `main.py`. Do not run TabbyAPI's
+`start.py`/`start.sh`: they create their own venv with CUDA torch. The config comments explain the
 VRAM budget knobs (`gpu_split`, `cache_size`) for 24 GB vs 32 GB cards.
 
 ## What's in `runtime/`
