@@ -28,8 +28,10 @@ Details, methodology and how the kernels work: [runtime/PERFORMANCE.md](runtime/
 | not supported | Instinct / CDNA (wave64, needs MFMA kernels), RDNA2 and older. The extension refuses to load on them |
 
 Requirements: Linux, ~15 GB free VRAM for 8k context (17 GB used after load on a 24 GB card),
-Python ≥ 3.10, [uv](https://docs.astral.sh/uv/). No system ROCm install needed — the `rocm` extra
-pulls PyTorch, the ROCm SDK and device libraries as wheels.
+Python ≥ 3.10, [uv](https://docs.astral.sh/uv/), a host C++ toolchain for the HIP build
+(`g++` with libstdc++ headers: `sudo apt install g++` / `dnf install gcc-c++`). No system ROCm
+install needed — the `rocm` extra pulls PyTorch, the ROCm SDK (clang/hipcc) and device libraries
+as wheels. The kernel driver (`amdgpu`, `/dev/kfd`) must be present and your user in the `render`/`video` group.
 
 ## Install
 
