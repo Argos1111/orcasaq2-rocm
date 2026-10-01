@@ -33,4 +33,4 @@ with torch.inference_mode():
         err = ((y.float() - yref).norm() / yref.norm()).item()
         print(f"ok  rel_err={err:.5f}{'  BAD' if err > 0.002 else ''}", flush=True)
 print("all done", flush=True)
-os._exit(0)
+sys.stdout.flush(); os._exit(0)   # _exit skips the (slow) CUDA teardown; flush first so piped output is not lost

@@ -31,4 +31,4 @@ with torch.inference_mode():
         print(f"shape{si} grid{g}: {'bit-exact over 20 runs' if nd==0 else f'NONDETERMINISTIC ({nd}/19 runs differ)'}", flush=True)
         bad+=nd>0
     print("determinism:", "OK" if bad==0 else f"FAIL ({bad} configs)")
-os._exit(1 if bad else 0)
+sys.stdout.flush(); os._exit(1 if bad else 0)

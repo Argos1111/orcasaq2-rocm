@@ -23,4 +23,4 @@ for rnd in range(4):
                 n+=1
     torch.cuda.synchronize(); dt=time.time()-tfirst; res.append(n/dt)
 print("decode tok/s per round:", " ".join(f"{r:.2f}" for r in res))
-os._exit(0)
+sys.stdout.flush(); os._exit(0)   # _exit skips the (slow) CUDA teardown; flush first so piped output is not lost
