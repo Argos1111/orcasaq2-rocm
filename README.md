@@ -51,9 +51,13 @@ hf download Continuum-AI-Corp/OrcaSAQ2-27B --local-dir models/OrcaSAQ2-27B
 ### First run
 
 ```sh
-HIP_VISIBLE_DEVICES=0 uv run orcasaq2/bench_decode.py          # ~3 min; prints tok/s for 4 rounds
-HIP_VISIBLE_DEVICES=0 MTP=1 uv run orcasaq2/bench_decode.py    # with speculative decoding
+HIP_VISIBLE_DEVICES=0 uv run --extra rocm orcasaq2/bench_decode.py          # ~3 min; tok/s for 4 rounds
+HIP_VISIBLE_DEVICES=0 MTP=1 uv run --extra rocm orcasaq2/bench_decode.py    # with speculative decoding
 ```
+
+> Always pass `--extra rocm` to `uv run` (or call `.venv/bin/python` directly): a bare `uv run`
+> re-syncs the environment to the project's default CUDA torch and the extension then fails with
+> `ImportError: libamdhip64.so.7`.
 
 On a GPU that is not in the measured list, run the first-contact check instead. It builds with
 debug traps so a wrong kernel assumption ends the process rather than hanging the card, then
@@ -70,7 +74,7 @@ git clone https://github.com/theroyallab/tabbyAPI
 cp orcasaq2/tabbyapi-config.yml tabbyAPI/config.yml       # Q8 cache, 64k context, MTP draft 3
 cp orcasaq2/tabbyapi_main.py   tabbyAPI/
 ln -s "$PWD/models" tabbyAPI/models
-cd tabbyAPI && HIP_VISIBLE_DEVICES=0 ORCASAQ2_KERNEL=../OrcaSAQ2-kernel uv run --project .. python tabbyapi_main.py
+cd tabbyAPI && HIP_VISIBLE_DEVICES=0 ORCASAQ2_KERNEL=../OrcaSAQ2-kernel ../.venv/bin/python tabbyapi_main.py
 ```
 
 The API is then at `http://127.0.0.1:5000/v1`. `tabbyapi_main.py` applies the embedding patch and

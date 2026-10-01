@@ -8,7 +8,7 @@
 # Everything runs under `timeout`: a hung kernel ends the process, not the machine.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-PY="${PY:-$(command -v python)}"
+PY="${PY:-.venv/bin/python}"   # the project venv (uv sync --extra rocm); plain `uv run` would re-sync to CUDA torch
 rebuild() {  # $1 = extra hipcc flags
   find exllamav3/exllamav3_ext -name "*_hip.*" -o -name "*.hip" | xargs -r rm -f
   HIPCC_COMPILE_FLAGS_APPEND="${HIPCC_COMPILE_FLAGS_APPEND:-} $1" uv sync --extra rocm --no-build-isolation --reinstall-package exllamav3 > /tmp/orcasaq2_build.log 2>&1 \
