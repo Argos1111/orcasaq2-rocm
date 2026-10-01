@@ -1,5 +1,7 @@
 # OrcaSAQ2-27B on AMD Radeon — ROCm runtime
 
+English | [日本語](README_ja.md)
+
 Run [OrcaSAQ2-27B](https://huggingface.co/Continuum-AI-Corp/OrcaSAQ2-27B) (a Qwen3.5-27B-class model
 quantised to ~3.2 bits/weight in the EXL3 trellis format) on a single **RDNA3 / RDNA4** Radeon at
 **38–52 tokens/s**, with an OpenAI-compatible API through TabbyAPI.
