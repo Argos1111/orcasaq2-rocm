@@ -2,7 +2,7 @@
 
 [English](README.md) | 日本語
 
-[OrcaSAQ2-27B](https://huggingface.co/Continuum-AI-Corp/OrcaSAQ2-27B)(Qwen3.5-27B 級のモデルを
+[OrcaSAQ2-27B](https://huggingface.co/orcarouter/OrcaSAQ-2-27B)(Qwen3.5-27B 級のモデルを
 EXL3 トレリス形式で約 3.2 bit/weight に量子化したもの)を、**RDNA3 / RDNA4** の Radeon 1 枚で
 **38–52 tokens/s** で動かし、TabbyAPI 経由で OpenAI 互換 API として提供するためのランタイムです。
 
@@ -46,7 +46,7 @@ uv venv && uv sync --extra rocm --no-install-project
 uv sync --extra rocm --no-build-isolation         # HIP 拡張をビルド(約 2 分)
 
 git clone https://github.com/Continuum-AI-Corp/OrcaSAQ2-kernel   # int8 埋め込みテーブル用のローダパッチ
-hf download Continuum-AI-Corp/OrcaSAQ2-27B --local-dir models/OrcaSAQ2-27B
+hf download orcarouter/OrcaSAQ-2-27B --local-dir models/OrcaSAQ2-27B
 ```
 
 > このチェックポイントは埋め込みテーブルを int8 で保存しています(1.3 GB 節約)。exllamav3 が

@@ -2,7 +2,7 @@
 
 English | [日本語](README_ja.md)
 
-Run [OrcaSAQ2-27B](https://huggingface.co/Continuum-AI-Corp/OrcaSAQ2-27B) (a Qwen3.5-27B-class model
+Run [OrcaSAQ2-27B](https://huggingface.co/orcarouter/OrcaSAQ-2-27B) (a Qwen3.5-27B-class model
 quantised to ~3.2 bits/weight in the EXL3 trellis format) on a single **RDNA3 / RDNA4** Radeon at
 **38–52 tokens/s**, with an OpenAI-compatible API through TabbyAPI.
 
@@ -45,7 +45,7 @@ uv venv && uv sync --extra rocm --no-install-project
 uv sync --extra rocm --no-build-isolation         # builds the HIP extension (~2 min)
 
 git clone https://github.com/Continuum-AI-Corp/OrcaSAQ2-kernel   # loader patch for the int8 embedding table
-hf download Continuum-AI-Corp/OrcaSAQ2-27B --local-dir models/OrcaSAQ2-27B
+hf download orcarouter/OrcaSAQ-2-27B --local-dir models/OrcaSAQ2-27B
 ```
 
 > The checkpoint stores its embedding table as int8 (saving 1.3 GB); exllamav3 needs the small
