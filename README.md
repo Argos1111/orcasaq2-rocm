@@ -17,7 +17,7 @@ was made to pay off. Everything else is upstream exllamav3 v1.5.1.
 | 192k | 13.5 | **21.3** | 14.6 | **22.1** |
 
 Prefill: 1100–1800 tok/s at 8–32k, ~700–950 tok/s at 192k. Outputs are bit-exact repeatable.
-Details, methodology and how the kernels work: [orcasaq2/PERFORMANCE.md](orcasaq2/PERFORMANCE.md).
+Details, methodology and how the kernels work: [runtime/PERFORMANCE.md](runtime/PERFORMANCE.md).
 
 ## Supported GPUs
 
@@ -51,8 +51,8 @@ hf download Continuum-AI-Corp/OrcaSAQ2-27B --local-dir models/OrcaSAQ2-27B
 ### First run
 
 ```sh
-HIP_VISIBLE_DEVICES=0 uv run --extra rocm orcasaq2/bench_decode.py          # ~3 min; tok/s for 4 rounds
-HIP_VISIBLE_DEVICES=0 MTP=1 uv run --extra rocm orcasaq2/bench_decode.py    # with speculative decoding
+HIP_VISIBLE_DEVICES=0 uv run --extra rocm runtime/bench_decode.py          # ~3 min; tok/s for 4 rounds
+HIP_VISIBLE_DEVICES=0 MTP=1 uv run --extra rocm runtime/bench_decode.py    # with speculative decoding
 ```
 
 > Always pass `--extra rocm` to `uv run` (or call `.venv/bin/python` directly): a bare `uv run`
@@ -64,15 +64,15 @@ debug traps so a wrong kernel assumption ends the process rather than hanging th
 checks every GEMM shape, bit-exact repeatability and speed (~10 min):
 
 ```sh
-HIP_VISIBLE_DEVICES=0 ./orcasaq2/check_device.sh
+HIP_VISIBLE_DEVICES=0 ./runtime/check_device.sh
 ```
 
 ## Serve with TabbyAPI
 
 ```sh
 git clone https://github.com/theroyallab/tabbyAPI
-cp orcasaq2/tabbyapi-config.yml tabbyAPI/config.yml       # Q8 cache, 64k context, MTP draft 3
-cp orcasaq2/tabbyapi_main.py   tabbyAPI/
+cp runtime/tabbyapi-config.yml tabbyAPI/config.yml       # Q8 cache, 64k context, MTP draft 3
+cp runtime/tabbyapi_main.py   tabbyAPI/
 ln -s "$PWD/models" tabbyAPI/models
 cd tabbyAPI && HIP_VISIBLE_DEVICES=0 ORCASAQ2_KERNEL=../OrcaSAQ2-kernel ../.venv/bin/python tabbyapi_main.py
 ```
@@ -81,7 +81,7 @@ The API is then at `http://127.0.0.1:5000/v1`. `tabbyapi_main.py` applies the em
 hands over to TabbyAPI's `main.py`; use it in place of `main.py`. The config comments explain the
 VRAM budget knobs (`gpu_split`, `cache_size`) for 24 GB vs 32 GB cards.
 
-## What's in `orcasaq2/`
+## What's in `runtime/`
 
 | file | purpose |
 |---|---|

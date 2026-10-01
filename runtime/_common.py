@@ -17,7 +17,7 @@ def model_dir():
 def apply_embedding_patch():
     k = os.environ.get("ORCASAQ2_KERNEL", "OrcaSAQ2-kernel")
     if os.path.isdir(os.path.join(k, "orcasaq2")):
-        sys.path.insert(0, k)
+        sys.path.insert(0, os.path.abspath(k))
     try:
         from orcasaq2.patches import int8_embedding
     except ImportError:
